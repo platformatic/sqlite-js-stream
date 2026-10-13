@@ -455,10 +455,6 @@ core to replicate, snapshot, compact, lease, and restore a SQLite database.
 - **CLI + YAML config** — this is a *library*. The `litestream replicate/restore/ltx/reset/snapshots`
   CLI and a `litestream.yml`-style config are out of scope for now.
 - **Metrics/telemetry** — no Prometheus/OpenTelemetry instrumentation yet.
-- **Full point-in-time restore matrix** — restoring by `txID` and by `timestamp` is supported,
-  including boundary, out-of-range (`NoMatchingBackupError`), mutually-exclusive, and
-  non-contiguous (`RestoreGapError`) cases. The exhaustive litestream CLI/timestamp edge-case
-  matrix is not re-tested verbatim.
 - **VFS real-time mirroring** — hooking into SQLite's VFS to mirror writes live is not implemented.
 - **IPC control server** — litestream's Unix-socket IPC server is not implemented.
 
