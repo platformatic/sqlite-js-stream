@@ -1,6 +1,6 @@
 {
   "name": "@platformatic/sqlite-js-stream-pg",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "PostgreSQL upload strategy (replica client) for @platformatic/sqlite-js-stream",
   "type": "module",
   "engines": {
