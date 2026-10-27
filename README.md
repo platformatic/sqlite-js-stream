@@ -32,11 +32,13 @@ pnpm build         # transpile src -> dist (.js + .d.ts), used by addons/tests
 ```
 
 The core package is published as **`@platformatic/sqlite-js-stream`** and the S3
-addon as **`@platformatic/sqlite-js-stream-s3`**:
+and PostgreSQL addons as **`@platformatic/sqlite-js-stream-s3`** and
+**`@platformatic/sqlite-js-stream-pg`**:
 
 ```bash
 pnpm add @platformatic/sqlite-js-stream
 pnpm add @platformatic/sqlite-js-stream-s3  # optional addon
+pnpm add @platformatic/sqlite-js-stream-pg   # optional addon
 ```
 
 Importing the addon registers the `s3` URL scheme with
@@ -182,6 +184,48 @@ timestamps are preserved as the `ltx-timestamp` object metadata.
 > implementing `send(command)`. Pass an in-memory fake (see
 > `packages/backend-s3/test/helpers/memory-s3.ts`) to exercise the addon without
 > network access.
+
+### PostgreSQL upload strategy
+
+The `@platformatic/sqlite-js-stream-pg` addon provides a PostgreSQL replica client.
+Import it once to register the `postgres://` and `postgresql://` schemes, then
+create clients from URLs or directly:
+
+```ts
+import { Replica, newReplicaClientFromURL } from '@platformatic/sqlite-js-stream';
+import { PgReplicaClient, PgLeaser } from '@platformatic/sqlite-js-stream-pg';
+
+// Via a URL: connection details from the URL, replica prefix from `?prefix=`.
+const client = newReplicaClientFromURL(
+  'postgres://user:pass@host:5432/mydb?prefix=app/db1',
+);
+
+// Or directly, with an explicit connection string.
+const pg = new PgReplicaClient({
+  url: 'postgres://user:pass@host:5432/mydb',
+  prefix: 'app/db1',
+});
+
+const replica = new Replica('/data/app.db', client);
+await replica.run({ intervalMs: 1000 });
+```
+
+Files are stored as one row in `ltx_files` plus one row per 1 MiB chunk in
+`ltx_chunks`, scoped by a `prefix` column, in a configurable schema (`?schema=`).
+Every file is written atomically (row + chunks in a single transaction), so a
+reader never sees a partially-written file. `created_at` preserves the LTX
+creation timestamp for point-in-time restore and retention.
+
+> **Fenced writes:** if the application itself elects the writer, call
+> `client.registerGeneration(n)` before writing. After registering, uploads from
+> an older generation are rejected with `ErrGenerationSuperseded`, so a paused
+> former writer that wakes up after losing its lease can never append to the
+> replica.
+
+> **Distributed leasing:** `PgLeaser` acquires/renews/releases a lease on a
+> `ltx_leases` row using a compare-and-swap `version` column, with the same
+> semantics as `S3Leaser` (`LeaseExistsError`, `ErrLeaseNotHeld`). Pass it to a
+> `Replica` via the `leaser` option so only one host writes at a time.
 
 ### Continuous sync
 

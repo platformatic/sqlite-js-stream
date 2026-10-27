@@ -39,7 +39,7 @@ prevents the WAL from being checkpointed past our position.
 | **ReplicaClient** (`src/replica-client.ts`) | An interface to a storage backend (`LTXFiles`, `OpenLTXFile`, `WriteLTXFile`, `DeleteLTXFiles`, `DeleteAll`). Addons implement this to add upload strategies. |
 | **File backend** (`src/backends/file/`) | The simplest backend: store LTX files in `<root>/ltx/<level>/<min>-<max>.ltx`, atomic writes. |
 | **Store** (`src/store.ts`) | Coordinate multiple `Replica`s: `syncAll()`, `snapshotAll()`, `compactAll()`, `enforceRetentionAll()`, `run()`. |
-| **Addons** (`packages/`) | Upload strategies live as separate workspace packages. Each addon depends on the core `sqlite-js-stream` and registers a URL scheme (e.g. `packages/backend-s3` registers `s3://`). |
+| **Addons** (`packages/`) | Upload strategies live as separate workspace packages. Each addon depends on the core `sqlite-js-stream` and registers a URL scheme (e.g. `packages/backend-s3` registers `s3://` and `packages/backend-pg` registers `postgres://` / `postgresql://`). |
 
 > The repository is a **pnpm workspace**: the core package is at the root and
 > upload-strategy addons live under `packages/*`. Addons import the `ReplicaClient`

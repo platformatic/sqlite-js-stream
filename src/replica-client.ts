@@ -63,6 +63,13 @@ export interface ReplicaClient {
   deleteAll(): Promise<void>;
   /** setLogger sets the logger for the client. */
   setLogger(logger: Logger): void;
+  /**
+   * Optional fenced-write capability. Raises the stored replication generation
+   * to `generation`, failing with {@link ErrGenerationSuperseded} if a higher
+   * one is already registered. After registering, uploads from older writers
+   * are rejected. Backends that support fencing implement this method.
+   */
+  registerGeneration?(generation: bigint): Promise<void>;
 }
 
 export interface LTXFilesOptions {
