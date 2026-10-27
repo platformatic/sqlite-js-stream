@@ -122,6 +122,15 @@ resumes instead of re-restoring. The output database should only be opened **rea
 await replica.ensureExists();
 ```
 
+Restoring a replica's own database (`outputPath` equal to its path, as
+`ensureExists()` does) makes it the writer from the restored position: the local
+LTX cache of any previous database at that path is discarded, and the next
+`sync()` uploads the following TXID, starting from a snapshot. Any `-wal` and
+`-shm` files left at the output path are removed before the restored database
+is moved into place. `sync()` throws `ErrReplicaAhead` (`ERR_REPLICA_AHEAD`)
+rather than skipping uploads when the replica already has a higher TXID than the
+local database.
+
 ### Manage many databases
 
 ```ts

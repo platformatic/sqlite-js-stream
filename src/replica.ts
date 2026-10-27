@@ -17,7 +17,7 @@
  */
 
 import { createReadStream } from 'node:fs';
-import { access, mkdir, open, readFile, rename, rm, stat, type FileHandle } from 'node:fs/promises';
+import { access, mkdir, open, readFile, rename, rm, stat, writeFile, type FileHandle } from 'node:fs/promises';
 import nodePath from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
@@ -48,6 +48,7 @@ import type { Logger } from './util/logger.ts';
 import { noopLogger } from './util/logger.ts';
 import {
   DatabaseError,
+  ErrReplicaAhead,
   InvalidArgumentError,
   LTXFormatError,
   PageSizeMismatchError,
@@ -423,6 +424,11 @@ export class Replica {
     const dbPos = await db.pos();
     const remotePos = await this.pos();
 
+    // Local TXIDs the replica already has would never be uploaded.
+    if (info !== null && dbPos <= remotePos) {
+      throw new ErrReplicaAhead(dbPos, remotePos);
+    }
+
     for (let txID = remotePos + 1n; txID <= dbPos; txID = (await this.pos()) + 1n) {
       await this.uploadLtxFile(0, txID, txID);
       this.posValue = txID;
@@ -759,7 +765,17 @@ export class Replica {
       await fh.close();
       fh = null;
 
+      // A WAL left by a previous database at this path would be replayed on top
+      // of the restored one.
+      await rm(`${opt.outputPath}-wal`, { force: true });
+      await rm(`${opt.outputPath}-shm`, { force: true });
       await rename(tmp, opt.outputPath);
+
+      // Restoring the replicated database itself: the local cache belongs to the
+      // previous database, and the next sync continues after the restored TXID.
+      if (nodePath.resolve(opt.outputPath) === nodePath.resolve(this.path)) {
+        await this.resetLocal(plan[plan.length - 1].maxTXID);
+      }
     } catch (err) {
       if (fh !== null) await fh.close().catch(() => {});
       await rm(tmp, { force: true }).catch(() => {});
@@ -997,6 +1013,19 @@ export class Replica {
       sources.push({ destroy: () => (rc as { destroy: () => void }).destroy() });
     }
     return new StreamLtxReader(rc as unknown as AsyncIterable<Uint8Array>);
+  }
+
+  /**
+   * Discards the local LTX cache and records `txID` as the local position, so
+   * that the next sync writes `txID + 1` from a snapshot of the database.
+   */
+  private async resetLocal(txID: bigint): Promise<void> {
+    this.close();
+    const db = await this.localDb();
+    await rm(db.ltxDir(), { recursive: true, force: true });
+    await mkdir(db.ltxLevelDir(0), { recursive: true });
+    await writeFile(db.baseTXIDPath(), `${txID}\n`);
+    this.posValue = null;
   }
 
   /** Close releases any internal database connection. */

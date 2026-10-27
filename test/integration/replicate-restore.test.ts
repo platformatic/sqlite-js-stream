@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { rm } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { FileReplicaClient, Replica } from '../../src/index.ts';
+import { ErrReplicaAhead, FileReplicaClient, Replica } from '../../src/index.ts';
 import { createWALDB, makeTempDir } from '../helpers/make-db.ts';
 
 test('end-to-end: replicate a WAL database to a file replica and restore', async () => {
@@ -104,5 +104,125 @@ test('sync replicates a header-only (empty) database', async () => {
     assert.equal(n, 1);
   } finally {
     replica.close();
+  }
+});
+
+function countRows(path: string): number {
+  const conn = new DatabaseSync(path);
+  try {
+    return (conn.prepare('SELECT count(*) AS n FROM t').get() as { n: number }).n;
+  } finally {
+    conn.close();
+  }
+}
+
+test('writes made after restoring a database on another host are replicated', async () => {
+  const t = createWALDB(['a', 'b']);
+  const client = new FileReplicaClient(makeTempDir('repl-'));
+  const first = new Replica(t.path, client);
+
+  // The new writer restores the database into its own path and keeps writing.
+  const path = join(makeTempDir('second-'), 'second.db');
+  const second = new Replica(path, client);
+
+  try {
+    await first.sync();
+    t.db.exec("INSERT INTO t (name) VALUES ('c')");
+    await first.sync();
+
+    await second.restore({ outputPath: path });
+    assert.equal((await second.syncStatus()).localTXID, 2n);
+
+    const conn = new DatabaseSync(path);
+    conn.exec('PRAGMA journal_mode=WAL');
+    conn.exec('PRAGMA wal_autocheckpoint=0');
+    try {
+      conn.exec("INSERT INTO t (name) VALUES ('d')");
+
+      // The first sync after the restore continues the sequence, from a snapshot.
+      const info = await second.sync();
+      assert.equal(info?.minTXID, 3n);
+      assert.deepEqual(await second.syncStatus(), { localTXID: 3n, remoteTXID: 3n, inSync: true });
+
+      // Later syncs are incremental again.
+      conn.exec("INSERT INTO t (name) VALUES ('e')");
+      assert.equal((await second.sync())?.minTXID, 4n);
+    } finally {
+      conn.close();
+    }
+
+    const out = join(makeTempDir('restore-'), 'restored.db');
+    await second.restore({ outputPath: out });
+    assert.equal(countRows(out), 5);
+  } finally {
+    first.close();
+    second.close();
+    t.close();
+  }
+});
+
+test('restore replaces an existing database, its WAL and its local cache', async () => {
+  const t = createWALDB(['a', 'b', 'c']);
+  const client = new FileReplicaClient(makeTempDir('repl-'));
+  const replica = new Replica(t.path, client);
+
+  // A stale copy of the database, with its own WAL and replication history.
+  const path = join(makeTempDir('stale-'), 'stale.db');
+  const stale = new DatabaseSync(path);
+  stale.exec('PRAGMA journal_mode=WAL');
+  stale.exec('PRAGMA wal_autocheckpoint=0');
+  stale.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
+  stale.exec("INSERT INTO t (name) VALUES ('stale')");
+  const staleReplica = new Replica(path, new FileReplicaClient(makeTempDir('stale-repl-')));
+  await staleReplica.sync();
+  staleReplica.close();
+
+  const restored = new Replica(path, client);
+
+  try {
+    await replica.sync();
+
+    // Copy the WAL aside, close the connection (which checkpoints and removes
+    // the WAL), then put the stale WAL back, as after a crash.
+    const wal = await readFile(`${path}-wal`);
+    stale.close();
+    await writeFile(`${path}-wal`, wal);
+
+    await restored.restore({ outputPath: path });
+    assert.equal(countRows(path), 3);
+    assert.equal((await restored.syncStatus()).localTXID, 1n);
+  } finally {
+    restored.close();
+    replica.close();
+    t.close();
+  }
+});
+
+test('sync fails when the replica is ahead of the local database', async () => {
+  const t = createWALDB(['a']);
+  const client = new FileReplicaClient(makeTempDir('repl-'));
+  const replica = new Replica(t.path, client);
+
+  // Another database replicated to the same replica, without restoring it.
+  const other = createWALDB(['x']);
+  const otherReplica = new Replica(other.path, client);
+
+  try {
+    await replica.sync();
+    t.db.exec("INSERT INTO t (name) VALUES ('b')");
+    await replica.sync();
+
+    await assert.rejects(otherReplica.sync(), (err: unknown) => {
+      assert.ok(err instanceof ErrReplicaAhead);
+      assert.equal(err.code, 'ERR_REPLICA_AHEAD');
+      assert.equal(err.localTXID, 1n);
+      assert.equal(err.remoteTXID, 2n);
+      return true;
+    });
+  } finally {
+    otherReplica.close();
+    replica.close();
+    other.close();
+    t.close();
   }
 });
