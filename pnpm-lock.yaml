@@ -183,6 +183,22 @@ importers:
         specifier: ^5.7.0
         version: 5.9.3
 
+  packages/backend-pg:
+    dependencies:
+      '@platformatic/sqlite-js-stream':
+        specifier: workspace:*
+        version: link:../..
+      postgres:
+        specifier: ^3.4.9
+        version: 3.4.9
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.19.2
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
   packages/backend-s3:
     dependencies:
       '@aws-sdk/client-s3':
@@ -781,6 +797,10 @@ packages:
 
   picomatch@4.0.7:
     resolution: {integrity: sha512-qcJu88Q2IWqJsDD529JKMdwGm/dvInW4HvQnRwiH9JtihJvzGOscDtHE3x1pBKeUOTysQ8kVmLnJ2kJu7yhcGA==}
+    engines: {node: '>=12'}
+
+  postgres@3.4.9:
+    resolution: {integrity: sha512-GD3qdB0x1z9xgFI6cdRD6xu2Sp2WCOEoe3mtnyB5Ee0XrrL5Pe+e4CCnJrRMnL1zYtRDZmQQVbvOttLnKDLnaw==}
     engines: {node: '>=12'}
 
   prelude-ls@1.2.1:
@@ -1593,6 +1613,8 @@ snapshots:
   peowly@2.0.1: {}
 
   picomatch@4.0.7: {}
+
+  postgres@3.4.9: {}
 
   prelude-ls@1.2.1: {}
 

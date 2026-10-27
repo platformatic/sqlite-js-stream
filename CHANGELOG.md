@@ -6,12 +6,29 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- New PostgreSQL backend addon, **`@platformatic/sqlite-js-stream-pg`**:
+  - `PgReplicaClient` implementing `ReplicaClient`, storing LTX files as a
+    `ltx_files` row plus 1 MiB `ltx_chunks` rows, scoped by a `prefix` column in
+    a configurable schema. Files are written atomically (row + chunks in one
+    transaction) so a reader never sees a partial file, and the primary key makes
+    a TXID range writable only once.
+  - `PgLeaser` implementing `Leaser` via a compare-and-swap `version` column on
+    an `ltx_leases` row (`LeaseExistsError`, `ErrLeaseNotHeld`).
+  - Fenced writes: `client.registerGeneration(n)` rejects uploads from older
+    generations with the new `ErrGenerationSuperseded` (`ERR_GENERATION_SUPERSEDED`)
+    error, so a paused former writer can never append after losing its lease.
+  - Registration of the `postgres://` / `postgresql://` URL schemes.
+
 ### Changed
 
 - `compressBlock` is now a byte-identical TypeScript port of Go's
   `pierrec/lz4/v4` Fast block compressor, so LTX files we write match Go's
   `superfly/ltx` encoder exactly (validated against the Go goldens in CI's
   `interop-go` job). `lz4js` is retained only for LZ4 block decompression.
+- `ReplicaClient` gained an optional `registerGeneration()` capability; existing
+  backends are unaffected (it is optional).
 
 ## [0.1.0] - 2025-01-01
 

@@ -1,0 +1,41 @@
+{
+  "name": "@platformatic/sqlite-js-stream-pg",
+  "version": "0.1.1",
+  "description": "PostgreSQL upload strategy (replica client) for @platformatic/sqlite-js-stream",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "license": "Apache-2.0",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "scripts": {
+    "test": "node --test 'test/**/*.test.ts'",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "pnpm build"
+  },
+  "dependencies": {
+    "@platformatic/sqlite-js-stream": "workspace:*",
+    "postgres": "^3.4.9"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.0"
+  }
+}
