@@ -57,7 +57,7 @@
     "lz4js": "^0.2.0"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
+    "@types/node": "^26.0.0",
     "eslint": "^9.39.5",
     "neostandard": "^0.14.0",
     "typescript": "^5.7.0"
