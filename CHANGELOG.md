@@ -6,6 +6,23 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- Writes made after restoring a database into the replica's own path (for
+  example with `ensureExists()` on a new host) are replicated. The local position
+  restarted at TXID 1, so `sync()` numbered the new changes with TXIDs the
+  replica already had and never uploaded them. Restore now discards the local
+  LTX cache and records the restored TXID, and the next `sync()` continues from
+  it with a snapshot.
+- Restore removes the `-wal` and `-shm` files left at the output path, which
+  SQLite would otherwise replay on top of the restored database.
+
+### Added
+
+- `ErrReplicaAhead` (`ERR_REPLICA_AHEAD`), thrown by `sync()` when the replica
+  has a higher TXID than the local database, instead of silently not uploading
+  the local changes.
+
 ### Added
 
 - New PostgreSQL backend addon, **`@platformatic/sqlite-js-stream-pg`**:

@@ -113,6 +113,23 @@ export class LocalDatabase {
     return `${this.path}-wal`;
   }
 
+  /**
+   * BaseTXIDPath returns the path of the file recording the TXID a restore left
+   * the database at, so that the next sync continues the replica's sequence.
+   */
+  baseTXIDPath(): string {
+    return nodePath.join(this.metaPath, 'base-txid');
+  }
+
+  /** Returns the TXID recorded by a restore, or 0 if there is none. */
+  private async baseTXID(): Promise<bigint> {
+    try {
+      return BigInt((await readFile(this.baseTXIDPath(), 'utf8')).trim());
+    } catch {
+      return 0n;
+    }
+  }
+
   /** LTXDir returns the local LTX root directory. */
   ltxDir(): string {
     return nodePath.join(this.metaPath, 'ltx');
@@ -160,10 +177,14 @@ export class LocalDatabase {
     return out;
   }
 
-  /** Pos returns the maximum TXID in the local level-0 cache (0 if none). */
+  /**
+   * Pos returns the maximum TXID in the local cache, or the TXID recorded by a
+   * restore if it is higher (0 if none).
+   */
   async pos(): Promise<bigint> {
     const m = await this.maxFile();
-    return m === null ? 0n : m.maxTXID;
+    const base = await this.baseTXID();
+    return m === null || m.maxTXID < base ? base : m.maxTXID;
   }
 
   /** Returns the local LTX file with the highest maxTXID across all levels. */
@@ -516,7 +537,9 @@ export class LocalDatabase {
     commit: number;
   } | null> {
     const max = await this.maxFile();
-    if (max === null) return null;
+    // After a restore the WAL position of the local files, if any, does not
+    // describe the restored database: the next sync starts from a snapshot.
+    if (max === null || max.maxTXID < (await this.baseTXID())) return null;
     try {
       // Only the 100-byte header is needed; do not read the whole file.
       const fh = await open(this.ltxPath(max.level, max.minTXID, max.maxTXID), 'r');

@@ -89,3 +89,24 @@ export class ErrGenerationSuperseded extends SqliteJsStreamError {
     this.generation = generation;
   }
 }
+
+/**
+ * The replica is ahead of the local database (`ERR_REPLICA_AHEAD`): its latest
+ * TXID is higher than the local one, so local changes would be numbered with
+ * TXIDs the replica already has. Raised by `sync()` instead of silently not
+ * uploading them, for example when a database was restored without recording
+ * the restored position, or another writer used the same replica.
+ */
+export class ErrReplicaAhead extends SqliteJsStreamError {
+  /** The local TXID. */
+  readonly localTXID: bigint;
+  /** The latest TXID of the replica. */
+  readonly remoteTXID: bigint;
+
+  constructor(localTXID: bigint, remoteTXID: bigint) {
+    super('ERR_REPLICA_AHEAD', `replica is ahead of the local database: local TXID ${localTXID}, replica TXID ${remoteTXID}`);
+    this.name = 'ErrReplicaAhead';
+    this.localTXID = localTXID;
+    this.remoteTXID = remoteTXID;
+  }
+}
