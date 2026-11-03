@@ -20,110 +20,102 @@ test('walChecksum computes the SQLite rolling checksum (LE)', () => {
   assert.equal(s1, 0x05060708 + s0);
 });
 
-test('WALReader reads a real WAL produced by node:sqlite', () => {
-  const t = createWALDB(['a', 'b', 'c', 'd', 'e']);
-  try {
-    const wal = new Uint8Array(readFileSync(t.walPath));
-    const r = new WALReader(wal);
-    assert.equal(r.pageSize(), 4096);
+test('WALReader reads a real WAL produced by node:sqlite', (t) => {
+  const tdb = createWALDB(['a', 'b', 'c', 'd', 'e']);
+  t.after(() => tdb.close());
 
-    const frames: { pgno: number; commit: number }[] = [];
-    const data = new Uint8Array(r.pageSize());
-    for (;;) {
-      let fr;
-      try {
-        fr = r.readFrame(data);
-      } catch (err) {
-        if (err instanceof WALEOFError) break;
-        throw err;
-      }
-      frames.push(fr);
-      assert.ok(fr.pgno >= 1);
+  const wal = new Uint8Array(readFileSync(tdb.walPath));
+  const r = new WALReader(wal);
+  assert.equal(r.pageSize(), 4096);
+
+  const frames: { pgno: number; commit: number }[] = [];
+  const data = new Uint8Array(r.pageSize());
+  for (;;) {
+    let fr;
+    try {
+      fr = r.readFrame(data);
+    } catch (err) {
+      if (err instanceof WALEOFError) break;
+      throw err;
     }
+    frames.push(fr);
+    assert.ok(fr.pgno >= 1);
+  }
 
-    assert.ok(frames.length > 0, 'expected at least one frame');
-    assert.ok(frames.some((f) => f.commit !== 0), 'expected a commit frame');
+  assert.ok(frames.length > 0, 'expected at least one frame');
+  assert.ok(frames.some((f) => f.commit !== 0), 'expected a commit frame');
 
-    const pm = new WALReader(wal).pageMap();
-    assert.ok(pm.commit > 0);
-    assert.equal(pm.commit, t.pageCount());
-    assert.ok(pm.pageIndex.size > 0);
-    assert.ok(pm.maxOffset > WALHeaderSize);
-    for (const pgno of pm.pageIndex.keys()) {
-      assert.ok(pgno <= pm.commit, `page ${pgno} exceeds commit ${pm.commit}`);
-    }
-  } finally {
-    t.close();
+  const pm = new WALReader(wal).pageMap();
+  assert.ok(pm.commit > 0);
+  assert.equal(pm.commit, tdb.pageCount());
+  assert.ok(pm.pageIndex.size > 0);
+  assert.ok(pm.maxOffset > WALHeaderSize);
+  for (const pgno of pm.pageIndex.keys()) {
+    assert.ok(pgno <= pm.commit, `page ${pgno} exceeds commit ${pm.commit}`);
   }
 });
 
-test('WALReader.withOffset resumes from a known frame offset', () => {
-  const t = createWALDB(['a', 'b', 'c', 'd', 'e']);
-  try {
-    const wal = new Uint8Array(readFileSync(t.walPath));
+test('WALReader.withOffset resumes from a known frame offset', (t) => {
+  const tdb = createWALDB(['a', 'b', 'c', 'd', 'e']);
+  t.after(() => tdb.close());
 
-    // Read all frames from the start.
-    const reader = new WALReader(wal);
-    const data = new Uint8Array(reader.pageSize());
-    const all: { pgno: number; commit: number }[] = [];
-    for (;;) {
-      try {
-        all.push(reader.readFrame(data));
-      } catch (err) {
-        if (err instanceof WALEOFError) break;
-        throw err;
-      }
+  const wal = new Uint8Array(readFileSync(tdb.walPath));
+
+  // Read all frames from the start.
+  const reader = new WALReader(wal);
+  const data = new Uint8Array(reader.pageSize());
+  const all: { pgno: number; commit: number }[] = [];
+  for (;;) {
+    try {
+      all.push(reader.readFrame(data));
+    } catch (err) {
+      if (err instanceof WALEOFError) break;
+      throw err;
     }
-    assert.ok(all.length > 2);
+  }
+  assert.ok(all.length > 2);
 
-    const frameSize = reader.pageSize() + WALFrameHeaderSize;
-    const salt1 = readU32BE(wal, 16);
-    const salt2 = readU32BE(wal, 20);
-    const offset = WALHeaderSize + 2 * frameSize; // start at frame index 2
+  const frameSize = reader.pageSize() + WALFrameHeaderSize;
+  const salt1 = readU32BE(wal, 16);
+  const salt2 = readU32BE(wal, 20);
+  const offset = WALHeaderSize + 2 * frameSize; // start at frame index 2
 
-    const resume = WALReader.withOffset(wal, offset, salt1, salt2);
-    const resumed: { pgno: number; commit: number }[] = [];
-    const d = new Uint8Array(resume.pageSize());
-    for (;;) {
-      try {
-        resumed.push(resume.readFrame(d));
-      } catch (err) {
-        if (err instanceof WALEOFError) break;
-        throw err;
-      }
+  const resume = WALReader.withOffset(wal, offset, salt1, salt2);
+  const resumed: { pgno: number; commit: number }[] = [];
+  const d = new Uint8Array(resume.pageSize());
+  for (;;) {
+    try {
+      resumed.push(resume.readFrame(d));
+    } catch (err) {
+      if (err instanceof WALEOFError) break;
+      throw err;
     }
+  }
 
-    assert.equal(resumed.length, all.length - 2);
-    for (let i = 0; i < resumed.length; i++) {
-      assert.deepEqual(resumed[i], all[2 + i]);
-    }
-  } finally {
-    t.close();
+  assert.equal(resumed.length, all.length - 2);
+  for (let i = 0; i < resumed.length; i++) {
+    assert.deepEqual(resumed[i], all[2 + i]);
   }
 });
 
-test('WALReader detects a header checksum mismatch', () => {
-  const t = createWALDB(['a']);
-  try {
-    const wal = new Uint8Array(readFileSync(t.walPath));
-    const bad = Uint8Array.from(wal);
-    bad[24] ^= 0xff;
-    assert.throws(() => new WALReader(bad), WALEOFError);
-  } finally {
-    t.close();
-  }
+test('WALReader detects a header checksum mismatch', (t) => {
+  const tdb = createWALDB(['a']);
+  t.after(() => tdb.close());
+
+  const wal = new Uint8Array(readFileSync(tdb.walPath));
+  const bad = Uint8Array.from(wal);
+  bad[24] ^= 0xff;
+  assert.throws(() => new WALReader(bad), WALEOFError);
 });
 
-test('WALReader rejects an invalid magic', () => {
-  const t = createWALDB(['a']);
-  try {
-    const wal = new Uint8Array(readFileSync(t.walPath));
-    const bad = Uint8Array.from(wal);
-    bad[0] = 0xff;
-    assert.throws(() => new WALReader(bad), /invalid wal header magic/);
-  } finally {
-    t.close();
-  }
+test('WALReader rejects an invalid magic', (t) => {
+  const tdb = createWALDB(['a']);
+  t.after(() => tdb.close());
+
+  const wal = new Uint8Array(readFileSync(tdb.walPath));
+  const bad = Uint8Array.from(wal);
+  bad[0] = 0xff;
+  assert.throws(() => new WALReader(bad), /invalid wal header magic/);
 });
 
 test('WALReader.pageMap drops pages beyond the final commit (shrunk DB)', () => {

@@ -53,65 +53,57 @@ function blobHash(db: DatabaseSync): string {
   return h.digest('hex');
 }
 
-test('restore streams a large database across a snapshot base + incremental overlay', async () => {
+test('restore streams a large database across a snapshot base + incremental overlay', async (t) => {
   const src = buildLargeDB(BIG_ROWS);
   const client = new FileReplicaClient(makeTempDir('repl-'));
   const replica = new Replica(src.path, client);
-  try {
-    // Base L0 sync, then a level-9 snapshot becomes the restore base.
-    await replica.sync();
-    await replica.snapshot();
+  t.after(() => replica.close());
+  t.after(() => src.close());
 
-    // Modify many existing pages and grow the DB so a later L0 must overlay
-    // changed + new pages onto the snapshot.
-    src.db.exec('UPDATE t SET data = randomblob(4096) WHERE id % 3 = 0');
-    src.db.exec(
-      'INSERT INTO t (id, data) SELECT id + 100000, randomblob(4096) FROM t WHERE id <= 100',
-    );
-    await replica.sync();
+  // Base L0 sync, then a level-9 snapshot becomes the restore base.
+  await replica.sync();
+  await replica.snapshot();
 
-    const out = join(makeTempDir('restore-'), 'big.db');
-    await replica.restore({ outputPath: out });
+  // Modify many existing pages and grow the DB so a later L0 must overlay
+  // changed + new pages onto the snapshot.
+  src.db.exec('UPDATE t SET data = randomblob(4096) WHERE id % 3 = 0');
+  src.db.exec(
+    'INSERT INTO t (id, data) SELECT id + 100000, randomblob(4096) FROM t WHERE id <= 100',
+  );
+  await replica.sync();
 
-    const restored = new DatabaseSync(out);
-    try {
-      const ic = restored.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
-      assert.equal(ic.integrity_check, 'ok');
+  const out = join(makeTempDir('restore-'), 'big.db');
+  await replica.restore({ outputPath: out });
 
-      // The streamed restore must reproduce the exact page contents.
-      assert.equal(blobHash(src.db), blobHash(restored));
+  const restored = new DatabaseSync(out);
+  t.after(() => restored.close());
 
-      const count = restored.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
-      assert.ok(count.n > BIG_ROWS, `expected >${BIG_ROWS} rows, got ${count.n}`);
-    } finally {
-      restored.close();
-    }
-  } finally {
-    replica.close();
-    src.close();
-  }
+  const ic = restored.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
+  assert.equal(ic.integrity_check, 'ok');
+
+  // The streamed restore must reproduce the exact page contents.
+  assert.equal(blobHash(src.db), blobHash(restored));
+
+  const count = restored.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
+  assert.ok(count.n > BIG_ROWS, `expected >${BIG_ROWS} rows, got ${count.n}`);
 });
 
-test('restore streams a single large snapshot with no incremental files', async () => {
+test('restore streams a single large snapshot with no incremental files', async (t) => {
   const src = buildLargeDB(BIG_ROWS);
   const client = new FileReplicaClient(makeTempDir('repl-'));
   const replica = new Replica(src.path, client);
-  try {
-    await replica.sync();
+  t.after(() => replica.close());
+  t.after(() => src.close());
 
-    const out = join(makeTempDir('restore-'), 'big.db');
-    await replica.restore({ outputPath: out });
+  await replica.sync();
 
-    const restored = new DatabaseSync(out);
-    try {
-      const ic = restored.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
-      assert.equal(ic.integrity_check, 'ok');
-      assert.equal(blobHash(src.db), blobHash(restored));
-    } finally {
-      restored.close();
-    }
-  } finally {
-    replica.close();
-    src.close();
-  }
+  const out = join(makeTempDir('restore-'), 'big.db');
+  await replica.restore({ outputPath: out });
+
+  const restored = new DatabaseSync(out);
+  t.after(() => restored.close());
+
+  const ic = restored.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
+  assert.equal(ic.integrity_check, 'ok');
+  assert.equal(blobHash(src.db), blobHash(restored));
 });

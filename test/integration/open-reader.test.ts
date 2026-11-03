@@ -34,60 +34,55 @@ function trackingReader(path: string, calls: string[], failReads = 0): ReaderCon
   };
 }
 
-test('openReader: the supplied connection pins sync snapshots', async () => {
-  const t = createWALDB(['a', 'b', 'c']);
+test('openReader: the supplied connection pins sync snapshots', async (t) => {
+  const tdb = createWALDB(['a', 'b', 'c']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
   const opened: string[] = [];
   const calls: string[] = [];
-  const replica = new Replica(t.path, client, undefined, {
+  const replica = new Replica(tdb.path, client, undefined, {
     openReader: (path) => {
       opened.push(path);
       return trackingReader(path, calls);
     },
   });
+  t.after(() => replica.close());
+  t.after(() => tdb.close());
 
-  try {
-    await replica.sync();
-    t.db.exec("INSERT INTO t (name) VALUES ('d'), ('e')");
-    await replica.sync();
-    await replica.snapshot();
+  await replica.sync();
+  tdb.db.exec("INSERT INTO t (name) VALUES ('d'), ('e')");
+  await replica.sync();
+  await replica.snapshot();
 
-    assert.deepEqual(opened, [t.path], 'reader is opened once and cached');
-    assert.ok(calls.includes('exec:BEGIN'));
-    assert.ok(calls.includes('exec:COMMIT'));
+  assert.deepEqual(opened, [tdb.path], 'reader is opened once and cached');
+  assert.ok(calls.includes('exec:BEGIN'));
+  assert.ok(calls.includes('exec:COMMIT'));
 
-    const out = join(makeTempDir('restore-'), 'restored.db');
-    await replica.restore({ outputPath: out });
-    const restored = new DatabaseSync(out);
-    const count = restored.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
-    assert.equal(count.n, 5);
-    restored.close();
-  } finally {
-    replica.close();
-    t.close();
-  }
+  const out = join(makeTempDir('restore-'), 'restored.db');
+  await replica.restore({ outputPath: out });
+  const restored = new DatabaseSync(out);
+  const count = restored.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
+  assert.equal(count.n, 5);
+  restored.close();
 
+  replica.close();
   assert.equal(calls.at(-1), 'close', 'replica.close() closes the reader');
 });
 
-test('a failed pinning read does not leave the read transaction open', async () => {
-  const t = createWALDB(['a', 'b', 'c']);
+test('a failed pinning read does not leave the read transaction open', async (t) => {
+  const tdb = createWALDB(['a', 'b', 'c']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
   const calls: string[] = [];
-  const replica = new Replica(t.path, client, undefined, {
+  const replica = new Replica(tdb.path, client, undefined, {
     openReader: (path) => trackingReader(path, calls, 1),
   });
+  t.after(() => replica.close());
+  t.after(() => tdb.close());
 
-  try {
-    await assert.rejects(replica.sync(), /simulated read failure/);
-    assert.ok(calls.includes('exec:ROLLBACK'));
+  await assert.rejects(replica.sync(), /simulated read failure/);
+  assert.ok(calls.includes('exec:ROLLBACK'));
 
-    // The next sync must start a fresh transaction rather than fail with
-    // "cannot start a transaction within a transaction".
-    const info = await replica.sync();
-    assert.equal(info?.minTXID, 1n);
-  } finally {
-    replica.close();
-    t.close();
-  }
+  // The next sync must start a fresh transaction rather than fail with
+  // "cannot start a transaction within a transaction".
+  const info = await replica.sync();
+  assert.equal(info?.minTXID, 1n);
 });

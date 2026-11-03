@@ -22,103 +22,97 @@ async function fileCount(client: FileReplicaClient, level: number): Promise<numb
   return n;
 }
 
-test('level-9 snapshot becomes the restore base', async () => {
-  const t = createWALDB(['a', 'b', 'c']);
+test('level-9 snapshot becomes the restore base', async (t) => {
+  const tdb = createWALDB(['a', 'b', 'c']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
-  try {
-    await replica.sync();
-    t.db.exec("INSERT INTO t (name) VALUES ('d')");
-    await replica.sync();
-    t.db.exec("INSERT INTO t (name) VALUES ('e')");
-    await replica.sync();
+  const replica = new Replica(tdb.path, client);
+  t.after(() => replica.close());
+  t.after(() => tdb.close());
 
-    await replica.snapshot();
+  await replica.sync();
+  tdb.db.exec("INSERT INTO t (name) VALUES ('d')");
+  await replica.sync();
+  tdb.db.exec("INSERT INTO t (name) VALUES ('e')");
+  await replica.sync();
 
-    // The restore plan should start with the level-9 snapshot base.
-    const plan = await calcRestorePlan(client, 0n);
-    assert.ok(plan.length >= 1);
-    assert.equal(plan[0].level, 9, 'first file is the snapshot');
-    assert.equal(plan[0].minTXID, 1n);
+  await replica.snapshot();
 
-    const out = join(makeTempDir('restore-'), 'snap.db');
-    await replica.restore({ outputPath: out });
+  // The restore plan should start with the level-9 snapshot base.
+  const plan = await calcRestorePlan(client, 0n);
+  assert.ok(plan.length >= 1);
+  assert.equal(plan[0].level, 9, 'first file is the snapshot');
+  assert.equal(plan[0].minTXID, 1n);
 
-    const restored = new DatabaseSync(out);
-    const count = restored.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
-    assert.equal(count.n, 5);
-    const ic = restored.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
-    assert.equal(ic.integrity_check, 'ok');
-    restored.close();
-  } finally {
-    replica.close();
-    t.close();
-  }
+  const out = join(makeTempDir('restore-'), 'snap.db');
+  await replica.restore({ outputPath: out });
+
+  const restored = new DatabaseSync(out);
+  const count = restored.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
+  assert.equal(count.n, 5);
+  const ic = restored.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
+  assert.equal(ic.integrity_check, 'ok');
+  restored.close();
 });
 
-test('Store opens, syncs, and closes multiple databases', async () => {
+test('Store opens, syncs, and closes multiple databases', async (t) => {
   const t1 = createWALDB(['a', 'b']);
   const t2 = createWALDB(['x', 'y', 'z']);
   const store = new Store();
   const client1 = new FileReplicaClient(makeTempDir('repl1-'));
   const client2 = new FileReplicaClient(makeTempDir('repl2-'));
-  try {
-    await store.openDB(t1.path, client1);
-    await store.openDB(t2.path, client2);
+  t.after(() => t1.close());
+  t.after(() => t2.close());
+  t.after(() => store.close());
 
-    await store.syncAll();
+  await store.openDB(t1.path, client1);
+  await store.openDB(t2.path, client2);
 
-    const r1 = store.replicas()[0];
-    const r2 = store.replicas()[1];
-    assert.equal((await r1.syncStatus()).inSync, true);
-    assert.equal((await r2.syncStatus()).inSync, true);
+  await store.syncAll();
 
-    let n1 = 0;
-    for await (const _ of client1.ltxFiles({ level: 0, seek: 0n, useMetadata: false })) n1++;
-    let n2 = 0;
-    for await (const _ of client2.ltxFiles({ level: 0, seek: 0n, useMetadata: false })) n2++;
-    assert.ok(n1 >= 1);
-    assert.ok(n2 >= 1);
+  const r1 = store.replicas()[0];
+  const r2 = store.replicas()[1];
+  assert.equal((await r1.syncStatus()).inSync, true);
+  assert.equal((await r2.syncStatus()).inSync, true);
 
-    const out = join(makeTempDir('restore-'), 's1.db');
-    await r1.restore({ outputPath: out });
-    const restored = new DatabaseSync(out);
-    const c = restored.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
-    assert.equal(c.n, 2);
-    restored.close();
-  } finally {
-    t1.close();
-    t2.close();
-    store.close();
-  }
+  let n1 = 0;
+  for await (const _ of client1.ltxFiles({ level: 0, seek: 0n, useMetadata: false })) n1++;
+  let n2 = 0;
+  for await (const _ of client2.ltxFiles({ level: 0, seek: 0n, useMetadata: false })) n2++;
+  assert.ok(n1 >= 1);
+  assert.ok(n2 >= 1);
+
+  const out = join(makeTempDir('restore-'), 's1.db');
+  await r1.restore({ outputPath: out });
+  const restored = new DatabaseSync(out);
+  const c = restored.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
+  assert.equal(c.n, 2);
+  restored.close();
 });
 
-test('Store compacts and enforces retention across databases', async () => {
-  const t = createWALDB(['a', 'b', 'c']);
+test('Store compacts and enforces retention across databases', async (t) => {
+  const tdb = createWALDB(['a', 'b', 'c']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
   const store = new Store();
-  try {
-    const replica = await store.openDB(t.path, client);
-    await store.syncAll();
-    t.db.exec("INSERT INTO t (name) VALUES ('d')");
-    await store.syncAll();
+  t.after(() => tdb.close());
+  t.after(() => store.close());
 
-    // Compact pending L0 files into a higher level, then GC the sources.
-    await store.compactAll();
-    await store.enforceRetentionAll({ l0RetentionMs: 0 });
+  const replica = await store.openDB(tdb.path, client);
+  await store.syncAll();
+  tdb.db.exec("INSERT INTO t (name) VALUES ('d')");
+  await store.syncAll();
 
-    // Only the live-head level-0 file is retained after GC (like litestream).
-    const l0 = await fileCount(client, 0);
-    assert.equal(l0, 1, 'only the live-head level-0 file remains after compaction + GC');
+  // Compact pending L0 files into a higher level, then GC the sources.
+  await store.compactAll();
+  await store.enforceRetentionAll({ l0RetentionMs: 0 });
 
-    const out = join(makeTempDir('restore-'), 'store.db');
-    await replica.restore({ outputPath: out });
-    const restored = new DatabaseSync(out);
-    const c = restored.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
-    assert.equal(c.n, 4);
-    restored.close();
-  } finally {
-    t.close();
-    store.close();
-  }
+  // Only the live-head level-0 file is retained after GC (like litestream).
+  const l0 = await fileCount(client, 0);
+  assert.equal(l0, 1, 'only the live-head level-0 file remains after compaction + GC');
+
+  const out = join(makeTempDir('restore-'), 'store.db');
+  await replica.restore({ outputPath: out });
+  const restored = new DatabaseSync(out);
+  const c = restored.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
+  assert.equal(c.n, 4);
+  restored.close();
 });

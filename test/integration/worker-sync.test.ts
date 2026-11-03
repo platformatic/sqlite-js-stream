@@ -30,8 +30,8 @@ async function restoredRowCount(out: string, clientPath: string): Promise<number
   }
 }
 
-test('runs continuous replication from a worker thread', async () => {
-  const t = createWALDB(['a', 'b', 'c']);
+test('runs continuous replication from a worker thread', async (t) => {
+  const tdb = createWALDB(['a', 'b', 'c']);
   const clientPath = join(makeTempDir('worker-'), 'repl');
 
   const worker = new Worker(new URL('../helpers/continuous-worker.ts', import.meta.url));
@@ -41,40 +41,37 @@ test('runs continuous replication from a worker thread', async () => {
     });
     worker.on('error', reject);
   });
+  t.after(() => worker.terminate());
+  t.after(() => tdb.close());
 
-  try {
-    worker.postMessage({ type: 'start', dbPath: t.path, clientPath, intervalMs: 25 });
-    await started;
+  worker.postMessage({ type: 'start', dbPath: tdb.path, clientPath, intervalMs: 25 });
+  await started;
 
-    // The application keeps writing on its own connection (main thread).
-    t.db.exec("INSERT INTO t (name) VALUES ('d'), ('e'), ('f')");
+  // The application keeps writing on its own connection (main thread).
+  tdb.db.exec("INSERT INTO t (name) VALUES ('d'), ('e'), ('f')");
 
-    // The worker thread should pick up the new rows and upload them. Poll by
-    // restoring: the worker may capture everything in its first sync or over a
-    // few iterations, so assert on the replicated data, not a specific TXID.
-    const out = join(makeTempDir('restore-'), 'db.db');
-    await waitUntil(async () => (await restoredRowCount(out, clientPath)) === 6);
+  // The worker thread should pick up the new rows and upload them. Poll by
+  // restoring: the worker may capture everything in its first sync or over a
+  // few iterations, so assert on the replicated data, not a specific TXID.
+  const out = join(makeTempDir('restore-'), 'db.db');
+  await waitUntil(async () => (await restoredRowCount(out, clientPath)) === 6);
 
-    // Stop the worker and wait for it to finish gracefully.
-    const done = new Promise<void>((resolve) => {
-      worker.on('message', (m) => {
-        if (m?.type === 'done') resolve();
-      });
+  // Stop the worker and wait for it to finish gracefully.
+  const done = new Promise<void>((resolve) => {
+    worker.on('message', (m) => {
+      if (m?.type === 'done') resolve();
     });
-    worker.postMessage({ type: 'stop' });
-    await done;
+  });
+  worker.postMessage({ type: 'stop' });
+  await done;
 
-    // Final restore in the main thread and verify integrity.
-    const replica = new Replica(out, new FileReplicaClient(clientPath));
-    await replica.restore({ outputPath: out });
-    const r = new DatabaseSync(out);
-    const count = r.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
-    assert.equal(count.n, 6);
-    const ic = r.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
-    assert.equal(ic.integrity_check, 'ok');
-    r.close();
-  } finally {
-    await worker.terminate();
-    t.close();
-  }
+  // Final restore in the main thread and verify integrity.
+  const replica = new Replica(out, new FileReplicaClient(clientPath));
+  await replica.restore({ outputPath: out });
+  const r = new DatabaseSync(out);
+  const count = r.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
+  assert.equal(count.n, 6);
+  const ic = r.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
+  assert.equal(ic.integrity_check, 'ok');
+  r.close();
 });

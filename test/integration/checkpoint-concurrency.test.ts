@@ -47,64 +47,60 @@ test('a pinned read transaction blocks WAL truncation', () => {
   reader.close();
 });
 
-test('sync captures uncheckpointed WAL growth pages', async () => {
+test('sync captures uncheckpointed WAL growth pages', async (t) => {
   // The connection stays open and autocheckpoint is off, so the extra rows live
   // only in the WAL. Without a pinned reader, the DB file header page_count is
   // stale and the snapshot would drop those pages.
-  const t = createWALDB(['a', 'b', 'c']);
+  const tdb = createWALDB(['a', 'b', 'c']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
-  try {
-    t.db.exec("INSERT INTO t (name) VALUES ('d'), ('e'), ('f'), ('g')");
+  const replica = new Replica(tdb.path, client);
+  t.after(() => replica.close());
+  t.after(() => tdb.close());
 
-    await replica.sync();
+  tdb.db.exec("INSERT INTO t (name) VALUES ('d'), ('e'), ('f'), ('g')");
 
-    const out = join(makeTempDir('restore-'), 'db.db');
-    await replica.restore({ outputPath: out });
-    const r = new DatabaseSync(out);
-    const count = r.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
-    assert.equal(count.n, 7);
-    const ic = r.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
-    assert.equal(ic.integrity_check, 'ok');
-    r.close();
-  } finally {
-    replica.close();
-    t.close();
-  }
+  await replica.sync();
+
+  const out = join(makeTempDir('restore-'), 'db.db');
+  await replica.restore({ outputPath: out });
+  const r = new DatabaseSync(out);
+  const count = r.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
+  assert.equal(count.n, 7);
+  const ic = r.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
+  assert.equal(ic.integrity_check, 'ok');
+  r.close();
 });
 
-test('sync stays valid under a concurrent truncating checkpoint', async () => {
-  const t = createWALDB(['a', 'b', 'c']);
+test('sync stays valid under a concurrent truncating checkpoint', async (t) => {
+  const tdb = createWALDB(['a', 'b', 'c']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
-  try {
-    for (let i = 0; i < 5; i++) {
-      t.db.exec(`INSERT INTO t (name) VALUES ('row${i}')`);
+  const replica = new Replica(tdb.path, client);
+  t.after(() => replica.close());
+  t.after(() => tdb.close());
 
-      const syncP = replica.sync();
-      const checkpointP = (async () => {
-        for (let k = 0; k < 3; k++) {
-          try {
-            t.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
-          } catch {
-            /* checkpoint may fail transiently if the pin is held */
-          }
-          await new Promise((r) => setTimeout(r, 1));
+  for (let i = 0; i < 5; i++) {
+    tdb.db.exec(`INSERT INTO t (name) VALUES ('row${i}')`);
+
+    const syncP = replica.sync();
+    const checkpointP = (async () => {
+      for (let k = 0; k < 3; k++) {
+        try {
+          tdb.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+        } catch {
+          /* checkpoint may fail transiently if the pin is held */
         }
-      })();
-      await Promise.all([syncP, checkpointP]);
-    }
-
-    const out = join(makeTempDir('restore-'), 'db.db');
-    await replica.restore({ outputPath: out });
-    const r = new DatabaseSync(out);
-    const count = r.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
-    assert.equal(count.n, 8);
-    const ic = r.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
-    assert.equal(ic.integrity_check, 'ok');
-    r.close();
-  } finally {
-    replica.close();
-    t.close();
+        await new Promise((r) => setTimeout(r, 1));
+      }
+    })();
+    await Promise.all([syncP, checkpointP]);
   }
+
+  const out = join(makeTempDir('restore-'), 'db.db');
+  await replica.restore({ outputPath: out });
+  const r = new DatabaseSync(out);
+  const count = r.prepare('SELECT count(*) AS n FROM t').get() as { n: number };
+  assert.equal(count.n, 8);
+  const ic = r.prepare('PRAGMA integrity_check').get() as { integrity_check: string };
+  assert.equal(ic.integrity_check, 'ok');
+  r.close();
 });

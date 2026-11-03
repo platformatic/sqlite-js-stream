@@ -25,125 +25,119 @@ async function assertRestored(replica: Replica, outPath: string, expected: numbe
   assert.equal(ic, 'ok', 'integrity_check after restore');
 }
 
-test('compact moves L0 files into a level-1 file and GC can prune the source', async () => {
-  const t = createWALDB(['a', 'b']);
+test('compact moves L0 files into a level-1 file and GC can prune the source', async (t) => {
+  const tdb = createWALDB(['a', 'b']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
-  try {
-    await replica.sync(); // L0 (1..1)
-    t.db.exec("INSERT INTO t (name) VALUES ('c')");
-    await replica.sync(); // L0 (2..2)
-    t.db.exec("INSERT INTO t (name) VALUES ('d')");
-    await replica.sync(); // L0 (3..3)
-    t.db.exec("INSERT INTO t (name) VALUES ('e')");
-    await replica.sync(); // L0 (4..4)
+  const replica = new Replica(tdb.path, client);
+  t.after(() => replica.close());
+  t.after(() => tdb.close());
 
-    assert.equal((await countLevel(client, 0)).length, 4);
+  await replica.sync(); // L0 (1..1)
+  tdb.db.exec("INSERT INTO t (name) VALUES ('c')");
+  await replica.sync(); // L0 (2..2)
+  tdb.db.exec("INSERT INTO t (name) VALUES ('d')");
+  await replica.sync(); // L0 (3..3)
+  tdb.db.exec("INSERT INTO t (name) VALUES ('e')");
+  await replica.sync(); // L0 (4..4)
 
-    const info = await replica.compact({ dstLevel: 1 });
-    assert.ok(info, 'compaction should produce a file');
-    assert.equal(info.level, 1);
-    assert.equal(info.minTXID, 1n);
-    assert.equal(info.maxTXID, 4n);
+  assert.equal((await countLevel(client, 0)).length, 4);
 
-    const l1 = await countLevel(client, 1);
-    assert.equal(l1.length, 1);
-    assert.equal(l1[0].minTXID, 1n);
-    assert.equal(l1[0].maxTXID, 4n);
+  const info = await replica.compact({ dstLevel: 1 });
+  assert.ok(info, 'compaction should produce a file');
+  assert.equal(info.level, 1);
+  assert.equal(info.minTXID, 1n);
+  assert.equal(info.maxTXID, 4n);
 
-    // Even before GC, the restore plan should prefer the compacted level-1 file.
-    const plan = await calcRestorePlan(client, 0n);
-    assert.equal(plan[0].level, 1);
-    assert.equal(plan[0].maxTXID, 4n);
+  const l1 = await countLevel(client, 1);
+  assert.equal(l1.length, 1);
+  assert.equal(l1[0].minTXID, 1n);
+  assert.equal(l1[0].maxTXID, 4n);
 
-    // GC removes the L0 source files now that L1 covers them. The newest L0
-    // file is the live head and is always retained (matching litestream).
-    const gc = await replica.enforceRetention({ l0RetentionMs: 0 });
-    assert.ok(gc.filesDeleted >= 3, 'old L0 files were pruned');
-    const remainingL0 = await countLevel(client, 0);
-    assert.equal(remainingL0.length, 1, 'only the newest level-0 file is retained');
-    assert.equal(remainingL0[0].maxTXID, 4n, 'the retained head is the newest');
-    assert.equal((await countLevel(client, 1)).length, 1);
+  // Even before GC, the restore plan should prefer the compacted level-1 file.
+  const plan = await calcRestorePlan(client, 0n);
+  assert.equal(plan[0].level, 1);
+  assert.equal(plan[0].maxTXID, 4n);
 
-    await assertRestored(replica, join(makeTempDir('restore-'), 'c.db'), 5);
-  } finally {
-    replica.close();
-    t.close();
-  }
+  // GC removes the L0 source files now that L1 covers them. The newest L0
+  // file is the live head and is always retained (matching litestream).
+  const gc = await replica.enforceRetention({ l0RetentionMs: 0 });
+  assert.ok(gc.filesDeleted >= 3, 'old L0 files were pruned');
+  const remainingL0 = await countLevel(client, 0);
+  assert.equal(remainingL0.length, 1, 'only the newest level-0 file is retained');
+  assert.equal(remainingL0[0].maxTXID, 4n, 'the retained head is the newest');
+  assert.equal((await countLevel(client, 1)).length, 1);
+
+  await assertRestored(replica, join(makeTempDir('restore-'), 'c.db'), 5);
 });
 
-test('enforceRetention prunes old snapshots and keeps the newest', async () => {
-  const t = createWALDB(['a', 'b']);
+test('enforceRetention prunes old snapshots and keeps the newest', async (t) => {
+  const tdb = createWALDB(['a', 'b']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
-  try {
-    await replica.sync();
-    await replica.snapshot(); // snapshot at tx2 (maxTXID = 2)
+  const replica = new Replica(tdb.path, client);
+  t.after(() => replica.close());
+  t.after(() => tdb.close());
 
-    t.db.exec("INSERT INTO t (name) VALUES ('c')");
-    await replica.sync();
-    await replica.snapshot(); // snapshot at tx3
+  await replica.sync();
+  await replica.snapshot(); // snapshot at tx2 (maxTXID = 2)
 
-    t.db.exec("INSERT INTO t (name) VALUES ('d')");
-    await replica.sync();
-    await replica.snapshot(); // snapshot at tx4
+  tdb.db.exec("INSERT INTO t (name) VALUES ('c')");
+  await replica.sync();
+  await replica.snapshot(); // snapshot at tx3
 
-    assert.equal((await countLevel(client, 9)).length, 3);
+  tdb.db.exec("INSERT INTO t (name) VALUES ('d')");
+  await replica.sync();
+  await replica.snapshot(); // snapshot at tx4
 
-    const result = await replica.enforceRetention({ snapshotRetain: 1 });
-    assert.equal(result.snapshotsDeleted, 2);
+  assert.equal((await countLevel(client, 9)).length, 3);
 
-    const snapshots = await countLevel(client, 9);
-    assert.equal(snapshots.length, 1);
-    // The newest snapshot should have the highest maxTXID among the kept one.
-    assert.equal(snapshots[0].maxTXID, 3n);
+  const result = await replica.enforceRetention({ snapshotRetain: 1 });
+  assert.equal(result.snapshotsDeleted, 2);
 
-    // Restore still yields the latest state.
-    await assertRestored(replica, join(makeTempDir('restore-'), 'r.db'), 4);
-  } finally {
-    replica.close();
-    t.close();
-  }
+  const snapshots = await countLevel(client, 9);
+  assert.equal(snapshots.length, 1);
+  // The newest snapshot should have the highest maxTXID among the kept one.
+  assert.equal(snapshots[0].maxTXID, 3n);
+
+  // Restore still yields the latest state.
+  await assertRestored(replica, join(makeTempDir('restore-'), 'r.db'), 4);
 });
 
-test('incremental sync resumes after compaction and GC without reusing TXIDs', async () => {
-  const t = createWALDB(['a']);
+test('incremental sync resumes after compaction and GC without reusing TXIDs', async (t) => {
+  const tdb = createWALDB(['a']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
-  try {
-    await replica.sync(); // L0 (1..1)
-    t.db.exec("INSERT INTO t (name) VALUES ('b')");
-    await replica.sync(); // L0 (2..2)
+  const replica = new Replica(tdb.path, client);
+  t.after(() => replica.close());
+  t.after(() => tdb.close());
 
-    // Compact L0 -> L1 and prune the (now covered) level-0 files. The newest
-    // level-0 file (2..2) is the live head and is retained.
-    await replica.compact({ dstLevel: 1 });
-    await replica.enforceRetention({ l0RetentionMs: 0 });
-    assert.equal((await countLevel(client, 0)).length, 1, 'the head L0 is retained');
-    assert.equal((await countLevel(client, 1)).length, 1);
+  await replica.sync(); // L0 (1..1)
+  tdb.db.exec("INSERT INTO t (name) VALUES ('b')");
+  await replica.sync(); // L0 (2..2)
 
-    // A later write must continue the sequence (TXID 3), not reuse 1..2.
-    t.db.exec("INSERT INTO t (name) VALUES ('c')");
-    await replica.sync();
+  // Compact L0 -> L1 and prune the (now covered) level-0 files. The newest
+  // level-0 file (2..2) is the live head and is retained.
+  await replica.compact({ dstLevel: 1 });
+  await replica.enforceRetention({ l0RetentionMs: 0 });
+  assert.equal((await countLevel(client, 0)).length, 1, 'the head L0 is retained');
+  assert.equal((await countLevel(client, 1)).length, 1);
 
-    const l0 = await countLevel(client, 0);
-    assert.equal(l0.length, 2, 'kept head + a new level-0 file');
-    assert.equal(l0[0].minTXID, 2n, 'oldest level-0 file is the retained head');
-    assert.equal(l0[1].minTXID, 3n, 'new L0 starts at TXID 3');
-    assert.equal(l0[1].maxTXID, 3n);
-    assert.equal(await replica.calcPos(), 3n);
+  // A later write must continue the sequence (TXID 3), not reuse 1..2.
+  tdb.db.exec("INSERT INTO t (name) VALUES ('c')");
+  await replica.sync();
 
-    await assertRestored(replica, join(makeTempDir('restore-'), 'r.db'), 3);
-  } finally {
-    replica.close();
-    t.close();
-  }
+  const l0 = await countLevel(client, 0);
+  assert.equal(l0.length, 2, 'kept head + a new level-0 file');
+  assert.equal(l0[0].minTXID, 2n, 'oldest level-0 file is the retained head');
+  assert.equal(l0[1].minTXID, 3n, 'new L0 starts at TXID 3');
+  assert.equal(l0[1].maxTXID, 3n);
+  assert.equal(await replica.calcPos(), 3n);
+
+  await assertRestored(replica, join(makeTempDir('restore-'), 'r.db'), 3);
 });
 
-test('run() schedules compaction and retention while replicating', async () => {
-  const t = createWALDB(['a', 'b']);
+test('run() schedules compaction and retention while replicating', async (t) => {
+  const tdb = createWALDB(['a', 'b']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
+  const replica = new Replica(tdb.path, client);
   const ac = new AbortController();
   const outPath = join(makeTempDir('restore-'), 'w.db');
 
@@ -154,50 +148,49 @@ test('run() schedules compaction and retention while replicating', async () => {
     retention: { snapshotRetain: 1, l0RetentionMs: 0 },
     signal: ac.signal,
   });
-  try {
-
-    // New writes land as additional L0 files over the next several ticks.
-    for (let i = 0; i < 5; i++) {
-      t.db.exec("INSERT INTO t (name) VALUES ('x')");
-      await sleep(50);
-    }
-
-    // Wait until all rows are replicated, then let the scheduling loop
-    // compact the pending L0 files into higher levels (settled state).
-    await waitForRestoredRows(replica, outPath, 7, 8000);
-    const deadline = Date.now() + 8000;
-    for (;;) {
-      let anyCompacted = 0;
-      for (let level = 1; level <= 3; level++) {
-        anyCompacted += (await countLevel(client, level)).length;
-      }
-      if (anyCompacted >= 1) break;
-      if (Date.now() > deadline) {
-        throw new Error('timed out waiting for compaction to run');
-      }
-      await sleep(150);
-    }
+  // Always stop the run loop, or a failed assertion leaves it (and the test
+  // process) running forever.
+  t.after(async () => {
     ac.abort();
     await runPromise;
+  });
+  t.after(() => replica.close());
+  t.after(() => tdb.close());
 
-    // Compaction should have lifted data into at least one higher level.
-    let compacted = 0;
-    for (let level = 1; level <= 3; level++) compacted += (await countLevel(client, level)).length;
-    assert.ok(compacted >= 1, 'compaction produced files at a higher level');
-
-    // The loop always retains at least the live-head level-0 file.
-    assert.ok(
-      (await countLevel(client, 0)).length >= 1,
-      'the live-head level-0 file is retained',
-    );
-  } finally {
-    // Always stop the run loop, or a failed assertion leaves it (and the test
-    // process) running forever.
-    ac.abort();
-    await runPromise;
-    replica.close();
-    t.close();
+  // New writes land as additional L0 files over the next several ticks.
+  for (let i = 0; i < 5; i++) {
+    tdb.db.exec("INSERT INTO t (name) VALUES ('x')");
+    await sleep(50);
   }
+
+  // Wait until all rows are replicated, then let the scheduling loop
+  // compact the pending L0 files into higher levels (settled state).
+  await waitForRestoredRows(replica, outPath, 7, 8000);
+  const deadline = Date.now() + 8000;
+  for (;;) {
+    let anyCompacted = 0;
+    for (let level = 1; level <= 3; level++) {
+      anyCompacted += (await countLevel(client, level)).length;
+    }
+    if (anyCompacted >= 1) break;
+    if (Date.now() > deadline) {
+      throw new Error('timed out waiting for compaction to run');
+    }
+    await sleep(150);
+  }
+  ac.abort();
+  await runPromise;
+
+  // Compaction should have lifted data into at least one higher level.
+  let compacted = 0;
+  for (let level = 1; level <= 3; level++) compacted += (await countLevel(client, level)).length;
+  assert.ok(compacted >= 1, 'compaction produced files at a higher level');
+
+  // The loop always retains at least the live-head level-0 file.
+  assert.ok(
+    (await countLevel(client, 0)).length >= 1,
+    'the live-head level-0 file is retained',
+  );
 });
 
 /** Restores repeatedly until `expected` rows are present (deterministic wait). */

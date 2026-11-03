@@ -67,37 +67,33 @@ test('library error classes share the common base and carry .code/name', () => {
   assert.ok(ErrCompactionTooEarly instanceof ErrCompactionTooEarlyError);
 });
 
-test('restore with an empty replica throws a coded NoMatchingBackupError', async () => {
+test('restore with an empty replica throws a coded NoMatchingBackupError', async (t) => {
   const client = new FileReplicaClient(makeTempDir('empty-'));
   const replica = new Replica('/tmp/does-not-matter.db', client);
-  try {
-    await assert.rejects(
-      replica.restore({ outputPath: join(makeTempDir('restore-'), 'x.db') }),
-      (err: unknown) => {
-        assert.ok(err instanceof NoMatchingBackupError);
-        assert.equal((err as NoMatchingBackupError).code, 'ERR_NO_MATCHING_BACKUP');
-        assert.equal((err as NoMatchingBackupError).message, 'no matching backup files available');
-        return true;
-      },
-    );
-  } finally {
-    replica.close();
-  }
+  t.after(() => replica.close());
+
+  await assert.rejects(
+    replica.restore({ outputPath: join(makeTempDir('restore-'), 'x.db') }),
+    (err: unknown) => {
+      assert.ok(err instanceof NoMatchingBackupError);
+      assert.equal((err as NoMatchingBackupError).code, 'ERR_NO_MATCHING_BACKUP');
+      assert.equal((err as NoMatchingBackupError).message, 'no matching backup files available');
+      return true;
+    },
+  );
 });
 
-test('restore validates the output path with a coded InvalidArgumentError', async () => {
+test('restore validates the output path with a coded InvalidArgumentError', async (t) => {
   const client = new FileReplicaClient(makeTempDir('x-'));
   const replica = new Replica('/tmp/does-not-matter.db', client);
-  try {
-    await assert.rejects(
-      replica.restore({ outputPath: '' }),
-      (err: unknown) => {
-        assert.ok(err instanceof InvalidArgumentError);
-        assert.equal((err as InvalidArgumentError).code, 'ERR_INVALID_ARGUMENT');
-        return true;
-      },
-    );
-  } finally {
-    replica.close();
-  }
+  t.after(() => replica.close());
+
+  await assert.rejects(
+    replica.restore({ outputPath: '' }),
+    (err: unknown) => {
+      assert.ok(err instanceof InvalidArgumentError);
+      assert.equal((err as InvalidArgumentError).code, 'ERR_INVALID_ARGUMENT');
+      return true;
+    },
+  );
 });

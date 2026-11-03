@@ -307,23 +307,21 @@ test('integrates with Replica.sync() then restore() via Postgres', async (t) => 
   const client = makeClient(t, { prefix: makePrefix() });
 
   const replica = new Replica(source.path, client);
-  try {
-    await replica.sync();
+  t.after(() => replica.close());
+  t.after(() => source.close());
 
-    const outDir = mkdtempSync(join(tmpdir(), 'sqlite-js-stream-pg-restore-'));
-    const outPath = join(outDir, 'restored.db');
-    await replica.restore({ outputPath: outPath });
+  await replica.sync();
 
-    const r = new DatabaseSync(outPath);
-    const n = (r.prepare('SELECT count(*) AS n FROM t').get() as { n: number }).n;
-    const integrity = (r.prepare('PRAGMA integrity_check').get() as { integrity_check: string })
-      .integrity_check;
-    r.close();
-    assert.equal(n, 6);
-    assert.equal(integrity, 'ok');
-    rmSync(outDir, { recursive: true, force: true });
-  } finally {
-    replica.close();
-    source.close();
-  }
+  const outDir = mkdtempSync(join(tmpdir(), 'sqlite-js-stream-pg-restore-'));
+  const outPath = join(outDir, 'restored.db');
+  await replica.restore({ outputPath: outPath });
+
+  const r = new DatabaseSync(outPath);
+  const n = (r.prepare('SELECT count(*) AS n FROM t').get() as { n: number }).n;
+  const integrity = (r.prepare('PRAGMA integrity_check').get() as { integrity_check: string })
+    .integrity_check;
+  r.close();
+  assert.equal(n, 6);
+  assert.equal(integrity, 'ok');
+  rmSync(outDir, { recursive: true, force: true });
 });

@@ -105,53 +105,59 @@ async function assertRestored(replica: Replica, outDir: string, expected: number
   assert.equal(ic.integrity_check, 'ok');
 }
 
-test('run() continuously syncs new writes until aborted', async () => {
-  const t = createWALDB(['a', 'b', 'c']);
+test('run() continuously syncs new writes until aborted', async (t) => {
+  const tdb = createWALDB(['a', 'b', 'c']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
+  const replica = new Replica(tdb.path, client);
   const ac = new AbortController();
   const outDir = makeTempDir('restore-');
 
   const runP = replica.run({ intervalMs: 25, signal: ac.signal });
-  try {
-    // Let the first sync run, then add more data.
-    await new Promise((r) => setTimeout(r, 30));
-    t.db.exec("INSERT INTO t (name) VALUES ('d'), ('e'), ('f')");
-
-    // The continuous loop must eventually recover all 6 rows regardless of
-    // whether the new rows land in the first L0 file or a later one.
-    await waitForRows(replica, join(outDir, 'db.db'), 6);
-  } finally {
+  t.after(async () => {
     ac.abort();
     await runP.catch(() => {});
-    replica.close();
-    t.close();
-  }
+  });
+  t.after(() => replica.close());
+  t.after(() => tdb.close());
 
+  // Let the first sync run, then add more data.
+  await new Promise((r) => setTimeout(r, 30));
+  tdb.db.exec("INSERT INTO t (name) VALUES ('d'), ('e'), ('f')");
+
+  // The continuous loop must eventually recover all 6 rows regardless of
+  // whether the new rows land in the first L0 file or a later one.
+  await waitForRows(replica, join(outDir, 'db.db'), 6);
+
+  // Stop the loop before the final restore.
+  ac.abort();
+  await runP.catch(() => {});
   await assertRestored(replica, outDir, 6);
 });
 
-test('run() keeps replicating after a transient write failure', async () => {
-  const t = createWALDB(['a', 'b']);
+test('run() keeps replicating after a transient write failure', async (t) => {
+  const tdb = createWALDB(['a', 'b']);
   const client = new FlakyOnceClient(new FileReplicaClient(makeTempDir('repl-')));
-  const replica = new Replica(t.path, client);
+  const replica = new Replica(tdb.path, client);
   const ac = new AbortController();
   const outDir = makeTempDir('restore-');
 
   const runP = replica.run({ intervalMs: 25, signal: ac.signal });
-  try {
-    // Add data; the first upload will fail, but the loop retries and recovers.
-    await new Promise((r) => setTimeout(r, 30));
-    t.db.exec("INSERT INTO t (name) VALUES ('c'), ('d')");
-
-    // The loop must eventually recover all 4 rows, surviving the transient error.
-    await waitForRows(replica, join(outDir, 'db.db'), 4);
-  } finally {
+  t.after(async () => {
     ac.abort();
     await runP.catch(() => {});
-    replica.close();
-    t.close();
-  }
+  });
+  t.after(() => replica.close());
+  t.after(() => tdb.close());
 
+  // Add data; the first upload will fail, but the loop retries and recovers.
+  await new Promise((r) => setTimeout(r, 30));
+  tdb.db.exec("INSERT INTO t (name) VALUES ('c'), ('d')");
+
+  // The loop must eventually recover all 4 rows, surviving the transient error.
+  await waitForRows(replica, join(outDir, 'db.db'), 4);
+
+  // Stop the loop before the final restore.
+  ac.abort();
+  await runP.catch(() => {});
   await assertRestored(replica, outDir, 4);
 });

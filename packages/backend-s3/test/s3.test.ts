@@ -293,34 +293,32 @@ test('writeLtxFile streams a large object via multipart upload', async () => {
   assert.deepEqual(stored.body, Buffer.from(body));
 });
 
-test('integrates with Replica.sync() then restore() via S3', async () => {
+test('integrates with Replica.sync() then restore() via S3', async (t) => {
   const source = createWALDB(['a', 'b', 'c', 'd', 'e', 'f']);
   const { client, s3 } = makeS3({ bucket: 'mybucket', prefix: 'db' });
 
   const replica = new Replica(source.path, client);
-  try {
-    await replica.sync();
-    assert.ok(
-      s3.objects.has('mybucket/db/ltx/0/0000000000000001-0000000000000001.ltx'),
-      'a level-0 LTX file should be uploaded',
-    );
+  t.after(() => replica.close());
+  t.after(() => source.close());
 
-    const outDir = mkdtempSync(join(tmpdir(), 'sqlite-js-stream-restore-'));
-    const outPath = join(outDir, 'restored.db');
-    await replica.restore({ outputPath: outPath });
+  await replica.sync();
+  assert.ok(
+    s3.objects.has('mybucket/db/ltx/0/0000000000000001-0000000000000001.ltx'),
+    'a level-0 LTX file should be uploaded',
+  );
 
-    const r = new DatabaseSync(outPath);
-    const n = (r.prepare('SELECT count(*) AS n FROM t').get() as { n: number }).n;
-    const integrity = (r.prepare('PRAGMA integrity_check').get() as { integrity_check: string })
-      .integrity_check;
-    r.close();
-    assert.equal(n, 6);
-    assert.equal(integrity, 'ok');
-    rmSync(outDir, { recursive: true, force: true });
-  } finally {
-    replica.close();
-    source.close();
-  }
+  const outDir = mkdtempSync(join(tmpdir(), 'sqlite-js-stream-restore-'));
+  const outPath = join(outDir, 'restored.db');
+  await replica.restore({ outputPath: outPath });
+
+  const r = new DatabaseSync(outPath);
+  const n = (r.prepare('SELECT count(*) AS n FROM t').get() as { n: number }).n;
+  const integrity = (r.prepare('PRAGMA integrity_check').get() as { integrity_check: string })
+    .integrity_check;
+  r.close();
+  assert.equal(n, 6);
+  assert.equal(integrity, 'ok');
+  rmSync(outDir, { recursive: true, force: true });
 });
 
 async function collect(stream: AsyncIterable<Uint8Array | string>): Promise<Uint8Array> {

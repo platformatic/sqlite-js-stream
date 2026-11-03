@@ -32,159 +32,145 @@ async function latestCreatedAt(client: FileReplicaClient): Promise<number> {
   return max;
 }
 
-test('pitr: restore to a specific txID boundary', async () => {
-  const t = createWALDB(['a', 'b', 'c']); // txID 1 -> 3 rows
+test('pitr: restore to a specific txID boundary', async (t) => {
+  const tdb = createWALDB(['a', 'b', 'c']); // txID 1 -> 3 rows
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
+  const replica = new Replica(tdb.path, client);
 
-  try {
-    await replica.sync(); // txID 1
-    t.db.exec("INSERT INTO t (name) VALUES ('d'), ('e')");
-    await replica.sync(); // txID 2 -> 5 rows
-    t.db.exec("INSERT INTO t (name) VALUES ('f')");
-    await replica.sync(); // txID 3 -> 6 rows
+  t.after(() => tdb.close());
 
-    const outTxid1 = join(makeTempDir('restore-'), 'r1.db');
-    await replica.restore({ outputPath: outTxid1, txID: 1n });
-    assert.equal(countRows(outTxid1), 3, 'restore at txID=1 has first batch only');
+  await replica.sync(); // txID 1
+  tdb.db.exec("INSERT INTO t (name) VALUES ('d'), ('e')");
+  await replica.sync(); // txID 2 -> 5 rows
+  tdb.db.exec("INSERT INTO t (name) VALUES ('f')");
+  await replica.sync(); // txID 3 -> 6 rows
 
-    const outTxid2 = join(makeTempDir('restore-'), 'r2.db');
-    await replica.restore({ outputPath: outTxid2, txID: 2n });
-    assert.equal(countRows(outTxid2), 5, 'restore at txID=2 has first two batches');
+  const outTxid1 = join(makeTempDir('restore-'), 'r1.db');
+  await replica.restore({ outputPath: outTxid1, txID: 1n });
+  assert.equal(countRows(outTxid1), 3, 'restore at txID=1 has first batch only');
 
-    const outLatest = join(makeTempDir('restore-'), 'r3.db');
-    await replica.restore({ outputPath: outLatest }); // txID=0 => latest
-    assert.equal(countRows(outLatest), 6, 'latest restore has all rows');
-  } finally {
-    t.close();
-  }
+  const outTxid2 = join(makeTempDir('restore-'), 'r2.db');
+  await replica.restore({ outputPath: outTxid2, txID: 2n });
+  assert.equal(countRows(outTxid2), 5, 'restore at txID=2 has first two batches');
+
+  const outLatest = join(makeTempDir('restore-'), 'r3.db');
+  await replica.restore({ outputPath: outLatest }); // txID=0 => latest
+  assert.equal(countRows(outLatest), 6, 'latest restore has all rows');
 });
 
-test('pitr: restore to a timestamp picks the latest backup at/before it', async () => {
-  const t = createWALDB(['a', 'b', 'c']); // txID 1 -> 3 rows
+test('pitr: restore to a timestamp picks the latest backup at/before it', async (t) => {
+  const tdb = createWALDB(['a', 'b', 'c']); // txID 1 -> 3 rows
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
+  const replica = new Replica(tdb.path, client);
 
-  try {
-    await replica.sync(); // txID 1, createdAt = t1
-    // Guarantee distinct timestamps between the two syncs.
-    await new Promise((r) => setTimeout(r, 5));
-    const t1 = await latestCreatedAt(client);
-    assert.ok(t1 > 0);
+  t.after(() => tdb.close());
 
-    t.db.exec("INSERT INTO t (name) VALUES ('d'), ('e')");
-    await replica.sync(); // txID 2, createdAt = t2 > t1
-    const t2 = await latestCreatedAt(client);
-    assert.ok(t2 > t1, 'expected strictly increasing timestamps');
+  await replica.sync(); // txID 1, createdAt = t1
+  // Guarantee distinct timestamps between the two syncs.
+  await new Promise((r) => setTimeout(r, 5));
+  const t1 = await latestCreatedAt(client);
+  assert.ok(t1 > 0);
 
-    // Target just after the first backup but before the second.
-    const outEarly = join(makeTempDir('restore-'), 'early.db');
-    await replica.restore({ outputPath: outEarly, timestamp: new Date(t1 + 1) });
-    assert.equal(countRows(outEarly), 3, 'timestamp before second sync keeps first batch only');
+  tdb.db.exec("INSERT INTO t (name) VALUES ('d'), ('e')");
+  await replica.sync(); // txID 2, createdAt = t2 > t1
+  const t2 = await latestCreatedAt(client);
+  assert.ok(t2 > t1, 'expected strictly increasing timestamps');
 
-    // Target after the second backup => latest.
-    const outLate = join(makeTempDir('restore-'), 'late.db');
-    await replica.restore({ outputPath: outLate, timestamp: new Date(t2 + 1000) });
-    assert.equal(countRows(outLate), 5, 'timestamp after second sync includes all rows');
-  } finally {
-    t.close();
-  }
+  // Target just after the first backup but before the second.
+  const outEarly = join(makeTempDir('restore-'), 'early.db');
+  await replica.restore({ outputPath: outEarly, timestamp: new Date(t1 + 1) });
+  assert.equal(countRows(outEarly), 3, 'timestamp before second sync keeps first batch only');
+
+  // Target after the second backup => latest.
+  const outLate = join(makeTempDir('restore-'), 'late.db');
+  await replica.restore({ outputPath: outLate, timestamp: new Date(t2 + 1000) });
+  assert.equal(countRows(outLate), 5, 'timestamp after second sync includes all rows');
 });
 
-test('pitr: timestamp before the earliest backup throws NoMatchingBackupError', async () => {
-  const t = createWALDB(['a', 'b']);
+test('pitr: timestamp before the earliest backup throws NoMatchingBackupError', async (t) => {
+  const tdb = createWALDB(['a', 'b']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
+  const replica = new Replica(tdb.path, client);
 
-  try {
-    await replica.sync();
-    const first = await latestCreatedAt(client);
-    await assert.rejects(
-      replica.restore({ outputPath: join(makeTempDir('restore-'), 'out.db'), timestamp: new Date(first - 10_000) }),
-      NoMatchingBackupError,
-    );
-  } finally {
-    t.close();
-  }
+  t.after(() => tdb.close());
+
+  await replica.sync();
+  const first = await latestCreatedAt(client);
+  await assert.rejects(
+    replica.restore({ outputPath: join(makeTempDir('restore-'), 'out.db'), timestamp: new Date(first - 10_000) }),
+    NoMatchingBackupError,
+  );
 });
 
-test('pitr: txID beyond the latest backup throws NoMatchingBackupError', async () => {
-  const t = createWALDB(['a', 'b']);
+test('pitr: txID beyond the latest backup throws NoMatchingBackupError', async (t) => {
+  const tdb = createWALDB(['a', 'b']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
+  const replica = new Replica(tdb.path, client);
 
-  try {
-    await replica.sync();
-    await assert.rejects(
-      replica.restore({ outputPath: join(makeTempDir('restore-'), 'out.db'), txID: 999n }),
-      NoMatchingBackupError,
-    );
-  } finally {
-    t.close();
-  }
+  t.after(() => tdb.close());
+
+  await replica.sync();
+  await assert.rejects(
+    replica.restore({ outputPath: join(makeTempDir('restore-'), 'out.db'), txID: 999n }),
+    NoMatchingBackupError,
+  );
 });
 
-test('pitr: txID and timestamp are mutually exclusive', async () => {
-  const t = createWALDB(['a']);
+test('pitr: txID and timestamp are mutually exclusive', async (t) => {
+  const tdb = createWALDB(['a']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
+  const replica = new Replica(tdb.path, client);
 
-  try {
-    await replica.sync();
-    await assert.rejects(
-      replica.restore({
-        outputPath: join(makeTempDir('restore-'), 'out.db'),
-        txID: 1n,
-        timestamp: new Date(),
-      }),
-      InvalidArgumentError,
-    );
-  } finally {
-    t.close();
-  }
+  t.after(() => tdb.close());
+
+  await replica.sync();
+  await assert.rejects(
+    replica.restore({
+      outputPath: join(makeTempDir('restore-'), 'out.db'),
+      txID: 1n,
+      timestamp: new Date(),
+    }),
+    InvalidArgumentError,
+  );
 });
 
-test('pitr: negative txID is rejected', async () => {
-  const t = createWALDB(['a']);
+test('pitr: negative txID is rejected', async (t) => {
+  const tdb = createWALDB(['a']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
+  const replica = new Replica(tdb.path, client);
 
-  try {
-    await replica.sync();
-    await assert.rejects(
-      replica.restore({ outputPath: join(makeTempDir('restore-'), 'out.db'), txID: -1n }),
-      InvalidArgumentError,
-    );
-  } finally {
-    t.close();
-  }
+  t.after(() => tdb.close());
+
+  await replica.sync();
+  await assert.rejects(
+    replica.restore({ outputPath: join(makeTempDir('restore-'), 'out.db'), txID: -1n }),
+    InvalidArgumentError,
+  );
 });
 
-test('pitr: latest restore raises RestoreGapError on non-contiguous files', async () => {
-  const t = createWALDB(['a', 'b']);
+test('pitr: latest restore raises RestoreGapError on non-contiguous files', async (t) => {
+  const tdb = createWALDB(['a', 'b']);
   const client = new FileReplicaClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
+  const replica = new Replica(tdb.path, client);
 
-  try {
-    await replica.sync(); // 1..1
-    t.db.exec("INSERT INTO t (name) VALUES ('c')");
-    await replica.sync(); // 2..2
-    t.db.exec("INSERT INTO t (name) VALUES ('d')");
-    await replica.sync(); // 3..3
+  t.after(() => tdb.close());
 
-    // Delete the level-0 file for TXID 2 to leave a gap: 1..1, 3..3.
-    const toDelete = [];
-    for await (const f of client.ltxFiles({ level: 0, seek: 0n, useMetadata: false })) {
-      if (f.maxTXID === 2n) toDelete.push(f);
-    }
-    assert.equal(toDelete.length, 1);
-    await client.deleteLtxFiles(toDelete);
+  await replica.sync(); // 1..1
+  tdb.db.exec("INSERT INTO t (name) VALUES ('c')");
+  await replica.sync(); // 2..2
+  tdb.db.exec("INSERT INTO t (name) VALUES ('d')");
+  await replica.sync(); // 3..3
 
-    await assert.rejects(
-      replica.restore({ outputPath: join(makeTempDir('restore-'), 'out.db') }),
-      RestoreGapError,
-    );
-  } finally {
-    t.close();
+  // Delete the level-0 file for TXID 2 to leave a gap: 1..1, 3..3.
+  const toDelete = [];
+  for await (const f of client.ltxFiles({ level: 0, seek: 0n, useMetadata: false })) {
+    if (f.maxTXID === 2n) toDelete.push(f);
   }
+  assert.equal(toDelete.length, 1);
+  await client.deleteLtxFiles(toDelete);
+
+  await assert.rejects(
+    replica.restore({ outputPath: join(makeTempDir('restore-'), 'out.db') }),
+    RestoreGapError,
+  );
 });
