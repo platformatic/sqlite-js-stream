@@ -21,6 +21,8 @@ import {
   type Leaser,
 } from '@platformatic/sqlite-js-stream';
 
+import { withDdlLock } from './ddl.ts';
+
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 export interface PgLeaserOptions {
@@ -80,15 +82,17 @@ export class PgLeaser implements Leaser {
   /** Creates the lease table once (idempotent). */
   private async ensureTable(): Promise<void> {
     if (this.tableCreated) return;
-    await this.sql`
-      CREATE TABLE IF NOT EXISTS ${this.sql(this.table())} (
-        prefix TEXT PRIMARY KEY,
-        generation BIGINT NOT NULL,
-        owner TEXT NOT NULL,
-        expires_at TIMESTAMPTZ NOT NULL,
-        version BIGINT NOT NULL
-      )
-    `;
+    await withDdlLock(this.sql, this.schema, this.tablePrefix, async (tx) => {
+      await tx`
+        CREATE TABLE IF NOT EXISTS ${this.sql(this.table())} (
+          prefix TEXT PRIMARY KEY,
+          generation BIGINT NOT NULL,
+          owner TEXT NOT NULL,
+          expires_at TIMESTAMPTZ NOT NULL,
+          version BIGINT NOT NULL
+        )
+      `;
+    });
     this.tableCreated = true;
   }
 

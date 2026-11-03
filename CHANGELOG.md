@@ -52,6 +52,13 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `PgReplicaClient.deleteLtxFiles()` deletes all the given files in one
   transaction.
 
+### Fixed
+
+- `PgReplicaClient.init()` and `PgLeaser` create their tables under a
+  transaction-level advisory lock, so several processes starting at once on a
+  fresh database no longer fail with a unique violation on `pg_type`
+  (concurrent `CREATE TABLE IF NOT EXISTS`).
+
 ### Added
 
 - New PostgreSQL backend addon, **`@platformatic/sqlite-js-stream-pg`**:

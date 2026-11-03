@@ -22,6 +22,8 @@ import { Readable } from 'node:stream';
 
 import postgres, { type ISql, type Sql } from 'postgres';
 
+import { withDdlLock } from './ddl.ts';
+
 import {
   ErrGenerationSuperseded,
   HeaderSize,
@@ -187,43 +189,45 @@ export class PgReplicaClient implements ReplicaClient {
 
   /** Creates the LTX tables (idempotent). */
   private async createTablesNow(): Promise<void> {
-    await this.sql`
-      CREATE TABLE IF NOT EXISTS ${this.sql(this.filesTable())} (
-        prefix TEXT NOT NULL,
-        level SMALLINT NOT NULL,
-        min_txid BIGINT NOT NULL,
-        max_txid BIGINT NOT NULL,
-        size BIGINT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        PRIMARY KEY (prefix, level, min_txid, max_txid)
-      )
-    `;
-    await this.sql`
-      CREATE TABLE IF NOT EXISTS ${this.sql(this.chunksTable())} (
-        prefix TEXT NOT NULL,
-        level SMALLINT NOT NULL,
-        min_txid BIGINT NOT NULL,
-        max_txid BIGINT NOT NULL,
-        seq INT NOT NULL,
-        data BYTEA NOT NULL,
-        PRIMARY KEY (prefix, level, min_txid, max_txid, seq)
-      )
-    `;
-    await this.sql`
-      CREATE TABLE IF NOT EXISTS ${this.sql(this.generationsTable())} (
-        prefix TEXT PRIMARY KEY,
-        generation BIGINT NOT NULL
-      )
-    `;
-    await this.sql`
-      CREATE TABLE IF NOT EXISTS ${this.sql(this.leasesTable())} (
-        prefix TEXT PRIMARY KEY,
-        generation BIGINT NOT NULL,
-        owner TEXT NOT NULL,
-        expires_at TIMESTAMPTZ NOT NULL,
-        version BIGINT NOT NULL
-      )
-    `;
+    await withDdlLock(this.sql, this.schema, this.tablePrefix, async (tx) => {
+      await tx`
+        CREATE TABLE IF NOT EXISTS ${this.sql(this.filesTable())} (
+          prefix TEXT NOT NULL,
+          level SMALLINT NOT NULL,
+          min_txid BIGINT NOT NULL,
+          max_txid BIGINT NOT NULL,
+          size BIGINT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (prefix, level, min_txid, max_txid)
+        )
+      `;
+      await tx`
+        CREATE TABLE IF NOT EXISTS ${this.sql(this.chunksTable())} (
+          prefix TEXT NOT NULL,
+          level SMALLINT NOT NULL,
+          min_txid BIGINT NOT NULL,
+          max_txid BIGINT NOT NULL,
+          seq INT NOT NULL,
+          data BYTEA NOT NULL,
+          PRIMARY KEY (prefix, level, min_txid, max_txid, seq)
+        )
+      `;
+      await tx`
+        CREATE TABLE IF NOT EXISTS ${this.sql(this.generationsTable())} (
+          prefix TEXT PRIMARY KEY,
+          generation BIGINT NOT NULL
+        )
+      `;
+      await tx`
+        CREATE TABLE IF NOT EXISTS ${this.sql(this.leasesTable())} (
+          prefix TEXT PRIMARY KEY,
+          generation BIGINT NOT NULL,
+          owner TEXT NOT NULL,
+          expires_at TIMESTAMPTZ NOT NULL,
+          version BIGINT NOT NULL
+        )
+      `;
+    });
   }
 
   async init(): Promise<void> {
