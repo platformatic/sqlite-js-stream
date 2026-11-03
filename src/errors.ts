@@ -76,8 +76,9 @@ export class DatabaseError extends SqliteJsStreamError {
 /**
  * A fenced write was rejected because a newer replication generation is already
  * registered (`ERR_GENERATION_SUPERSEDED`). Raised by a backend that supports
- * generation fencing (e.g. the Postgres client) when an older writer attempts
- * to upload after a new writer has registered its generation.
+ * generation fencing (the PostgreSQL and S3 clients) when an older writer
+ * attempts to upload or delete files after a new writer has registered its
+ * generation. A `Replica` that receives it stops writing.
  */
 export class ErrGenerationSuperseded extends SqliteJsStreamError {
   /** The higher generation that superseded this writer. */

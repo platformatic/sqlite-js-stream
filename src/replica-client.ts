@@ -66,8 +66,12 @@ export interface ReplicaClient {
   /**
    * Optional fenced-write capability. Raises the stored replication generation
    * to `generation`, failing with {@link ErrGenerationSuperseded} if a higher
-   * one is already registered. After registering, uploads from older writers
-   * are rejected. Backends that support fencing implement this method.
+   * one is already registered, and fences the client on it. Once it resolves,
+   * uploads and deletions of older generations fail with
+   * {@link ErrGenerationSuperseded}, and none of their uploads that the
+   * caller's next restore misses is ever read. Call it before restoring, then
+   * write. Backends that support fencing implement this method (PostgreSQL,
+   * S3).
    */
   registerGeneration?(generation: bigint): Promise<void>;
 }

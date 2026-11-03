@@ -48,6 +48,7 @@ import type { Logger } from './util/logger.ts';
 import { noopLogger } from './util/logger.ts';
 import {
   DatabaseError,
+  ErrGenerationSuperseded,
   ErrReplicaAhead,
   InvalidArgumentError,
   LTXFormatError,
@@ -300,6 +301,7 @@ export class Replica {
   private leaseTimer: NodeJS.Timeout | null = null;
   private runActive = false;
   private openReader: OpenReader | undefined;
+  private supersededError: ErrGenerationSuperseded | null = null;
 
   constructor(
     path: string,
@@ -350,10 +352,31 @@ export class Replica {
     return this.leasePrimary;
   }
 
-  /** @internal Throws if a leaser is set but this replica does not hold it. */
+  /**
+   * The error that stopped this replica because a higher writer generation was
+   * registered on its fenced client, or null. Once set, every write operation
+   * (`sync`, `snapshot`, compaction, retention) fails with it.
+   */
+  get superseded(): ErrGenerationSuperseded | null {
+    return this.supersededError;
+  }
+
+  /**
+   * @internal Throws if this replica was superseded, or if a leaser is set but
+   * this replica does not hold it.
+   */
   private assertCanWrite(): void {
+    if (this.supersededError !== null) throw this.supersededError;
     if (this.leaserValue !== null && !this.leasePrimary) {
       throw new ErrLeaseNotHeld();
+    }
+  }
+
+  /** Records a fenced-write rejection so the replica stops writing. */
+  private noteSuperseded(err: unknown): void {
+    if (this.supersededError === null && isGenerationSuperseded(err)) {
+      this.supersededError = err;
+      this.logger.error('replica superseded by a newer generation; stopping writes', err);
     }
   }
 
@@ -446,6 +469,9 @@ export class Replica {
    * `intervalMs`, compacts per level on each level's wall-clock bucket, takes
    * snapshots on `snapshotIntervalMs`, and enforces retention. Errors are logged
    * and the loop keeps going, so a transient failure does not stop replication.
+   * The exception is {@link ErrGenerationSuperseded}: a fenced client reported
+   * that a newer writer took over, so the loop stops, releases the lease and
+   * rejects with that error.
    *
    * Compaction mirrors litestream: each level is compacted at most once per
    * bucket (see {@link CompactionLevels}); the legacy `compactionIntervalMs`
@@ -529,10 +555,10 @@ export class Replica {
         try {
           await this.sync();
         } catch (err) {
-          this.logger.error('replica sync error', err);
+          if (!isGenerationSuperseded(err)) this.logger.error('replica sync error', err);
         }
       }
-      if (signal?.aborted) break;
+      if (signal?.aborted || this.supersededError !== null) break;
 
       if (leaser !== null && !primary) {
         await sleep(intervalMs, undefined, { signal });
@@ -596,7 +622,7 @@ export class Replica {
         l0RetentionNext = now + l0RetentionCheckIntervalMs;
       }
 
-      if (signal?.aborted) break;
+      if (signal?.aborted || this.supersededError !== null) break;
       try {
         await sleep(intervalMs, undefined, { signal });
       } catch {
@@ -617,6 +643,9 @@ export class Replica {
       this.leasePrimary = false;
     }
     this.runActive = false;
+
+    // A superseded writer must not keep retrying: surface the error.
+    if (this.supersededError !== null) throw this.supersededError;
   }
 
   /**
@@ -687,7 +716,13 @@ export class Replica {
     const p = (await this.localDb()).ltxPath(level, minTXID, maxTXID);
     // Stream the local LTX file straight to the client (no whole-file buffer).
     const body = createReadStream(p) as unknown as AsyncIterable<Uint8Array>;
-    const info = await this.client.writeLtxFile({ level, minTXID, maxTXID }, body);
+    let info: FileInfo;
+    try {
+      info = await this.client.writeLtxFile({ level, minTXID, maxTXID }, body);
+    } catch (err) {
+      this.noteSuperseded(err);
+      throw err;
+    }
     this.logger.debug('ltx file uploaded', { level, minTXID, maxTXID, size: info.size });
     return info;
   }
@@ -1323,7 +1358,12 @@ export class Replica {
   private async deleteFiles(files: FileInfo[]): Promise<void> {
     if (files.length === 0) return;
     this.logger.debug('deleting ltx files', { count: files.length });
-    await this.client.deleteLtxFiles(files);
+    try {
+      await this.client.deleteLtxFiles(files);
+    } catch (err) {
+      this.noteSuperseded(err);
+      throw err;
+    }
     const db = await this.localDb();
     for (const f of files) {
       const p = db.ltxPath(f.level, f.minTXID, f.maxTXID);
@@ -1361,6 +1401,17 @@ export class Replica {
     }
     return new StreamLtxReader(rc as unknown as AsyncIterable<Uint8Array>);
   }
+}
+
+/**
+ * Returns true for {@link ErrGenerationSuperseded}, also when thrown by a copy
+ * of this module loaded by a backend package (compared by `code`).
+ */
+function isGenerationSuperseded(err: unknown): err is ErrGenerationSuperseded {
+  return (
+    err instanceof ErrGenerationSuperseded ||
+    (err instanceof Error && (err as { code?: unknown }).code === 'ERR_GENERATION_SUPERSEDED')
+  );
 }
 
 /**

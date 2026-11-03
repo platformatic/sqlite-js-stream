@@ -11,8 +11,8 @@
  * fails with a unique-constraint error).
  *
  * The client also supports *fenced writes*: when a {@link PgReplicaClientOptions.generation}
- * is set, every upload locks the `ltx_generations` row (`FOR SHARE`) and rejects
- * the write with {@link ErrGenerationSuperseded} if a newer generation is
+ * is set, every upload and deletion locks the `ltx_generations` row (`FOR SHARE`)
+ * and is rejected with {@link ErrGenerationSuperseded} if a newer generation is
  * already registered. This lets an application elect the writer so a paused
  * former writer that wakes up after losing its lease can never append to the
  * replica.
@@ -475,10 +475,18 @@ export class PgReplicaClient implements ReplicaClient {
     }
   }
 
+  /**
+   * Deletes LTX files in one transaction. With a generation set, the
+   * transaction first locks the generation row (`FOR SHARE`) and fails with
+   * {@link ErrGenerationSuperseded} if a newer generation is registered, as
+   * uploads do.
+   */
   async deleteLtxFiles(infos: FileInfo[]): Promise<void> {
     await this.init();
-    for (const info of infos) {
-      await this.sql.begin(async (tx) => {
+    if (infos.length === 0) return;
+    await this.sql.begin(async (tx) => {
+      await this.assertFenced(tx);
+      for (const info of infos) {
         await tx`
           DELETE FROM ${this.sql(this.chunksTable())}
           WHERE prefix = ${this.prefix} AND level = ${info.level}
@@ -489,13 +497,15 @@ export class PgReplicaClient implements ReplicaClient {
           WHERE prefix = ${this.prefix} AND level = ${info.level}
             AND min_txid = ${txid(info.minTXID)} AND max_txid = ${txid(info.maxTXID)}
         `;
-      });
-    }
+      }
+    });
   }
 
+  /** Deletes every LTX file of the prefix, fenced like {@link deleteLtxFiles}. */
   async deleteAll(): Promise<void> {
     await this.init();
     await this.sql.begin(async (tx) => {
+      await this.assertFenced(tx);
       await tx`DELETE FROM ${this.sql(this.chunksTable())} WHERE prefix = ${this.prefix}`;
       await tx`DELETE FROM ${this.sql(this.filesTable())} WHERE prefix = ${this.prefix}`;
     });
