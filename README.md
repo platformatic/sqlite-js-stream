@@ -242,16 +242,82 @@ Every file is written atomically (row + chunks in a single transaction), so a
 reader never sees a partially-written file. `created_at` preserves the LTX
 creation timestamp for point-in-time restore and retention.
 
-> **Fenced writes:** if the application itself elects the writer, call
-> `client.registerGeneration(n)` before writing. After registering, uploads from
-> an older generation are rejected with `ErrGenerationSuperseded`, so a paused
-> former writer that wakes up after losing its lease can never append to the
-> replica.
+> **Fenced writes:** see [Fenced writes](#fenced-writes).
 
 > **Distributed leasing:** `PgLeaser` acquires/renews/releases a lease on a
 > `ltx_leases` row using a compare-and-swap `version` column, with the same
 > semantics as `S3Leaser` (`LeaseExistsError`, `ErrLeaseNotHeld`). Pass it to a
 > `Replica` via the `leaser` option so only one host writes at a time.
+
+### Fenced writes
+
+When the application elects the writer of a database itself (with its own lease,
+or a `Leaser`), a former writer that was paused (GC, a stopped VM, a network
+partition) can wake up after losing the lease and keep uploading. The S3 and
+PostgreSQL clients can reject those uploads: give every writer a *generation*
+that only grows (for example a fencing token from your lease), and follow this
+order when a writer takes over a database:
+
+```ts
+import { Replica } from '@platformatic/sqlite-js-stream';
+import { S3ReplicaClient } from '@platformatic/sqlite-js-stream-s3';
+
+const client = new S3ReplicaClient({ bucket: 'my-bucket', prefix: 'app/db1' });
+
+// 1. Register: fails with ErrGenerationSuperseded if a higher generation is
+//    registered. From now on, older writers' uploads and deletions fail.
+await client.registerGeneration(token);
+
+// 2. Restore (or keep the local database if it is at the replica's latest TXID).
+const replica = new Replica('/data/app.db', client);
+await replica.restore({ outputPath: '/data/app.db' });
+
+// 3. Write and replicate.
+await replica.sync();
+```
+
+`registerGeneration(n)` sets the client's generation (the `generation` option
+does the same without registering). From then on:
+
+- An upload, compaction or retention deletion fails with
+  `ErrGenerationSuperseded` (`ERR_GENERATION_SUPERSEDED`) once a higher
+  generation is registered. The `Replica` then stops writing: every later
+  `sync()`, `snapshot()`, compaction and retention call fails with the same
+  error (also in `replica.superseded`), and `run()` stops and rejects with it
+  instead of retrying.
+- An LTX file of a given level and TXID range is written only once.
+
+**PostgreSQL** checks the generation in the transaction that writes or deletes
+the files (`SELECT … FOR SHARE` on the `ltx_generations` row), so registering
+waits for the uploads in flight and the following ones fail.
+
+**S3** can't check one object and write another in one request, so fencing is a
+protocol of conditional writes on a `generation.json` object next to the `ltx/`
+directory:
+
+- `registerGeneration(n)` raises the generation with `If-Match`/`If-None-Match`,
+  then reads the replica's latest TXID `T` and records the *fence* `(n, T)` in
+  the same object. It does both, so there is no separate step after the restore.
+- Fenced uploads use `If-None-Match: *` and store their generation in the
+  `ltx-generation` metadata. After each upload, the client reads
+  `generation.json` and fails if a higher generation is registered. An upload
+  that resolves was therefore made before any newer writer registered, and
+  every newer writer's restore sees it.
+- An upload of a superseded writer can still land if it was in flight. Listings
+  ignore a file whose generation is lower than a fence's and whose `maxTXID` is
+  above that fence's `T`. If such a file holds a key that the new writer needs,
+  the new writer replaces it (`If-Match` on its ETag).
+- Deletions check `generation.json` right before `DeleteObjects`. A deletion
+  sent just before a new generation registers still applies; this is the one
+  race the protocol leaves open, and it needs the old writer to pause between
+  the check and the request.
+- Once a fence exists, listing a file that ends above the lowest fence costs
+  one `HeadObject` request to read its generation (cached per key and ETag; a
+  writer knows its own files). Replicas that never registered a generation pay
+  one `GetObject` of `generation.json` per listing (a 404).
+- `deleteAll()` keeps `generation.json`, so a superseded writer stays fenced.
+
+The file backend does not implement fenced writes.
 
 ### Continuous sync
 

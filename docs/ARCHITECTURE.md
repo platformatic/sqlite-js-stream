@@ -77,7 +77,8 @@ every committed page. Combined with incremental level-0 files this gives point-i
 `replicaPos + 1` to `dbPos`, advancing the replicated position (which is the max `MaxTXID` among
 level-0 files on the client). `Replica.run({ intervalMs, signal })` loops this continuously until
 the `AbortSignal` is aborted: it syncs immediately, waits `intervalMs`, then repeats. A transient
-sync error is logged and the loop keeps going.
+sync error is logged and the loop keeps going. `ErrGenerationSuperseded` is not transient: the loop
+stops, releases the lease and rejects with it (see [Fenced writes](#fenced-writes)).
 
 ### Replica.restore()
 
@@ -233,6 +234,89 @@ expires.
 
 ---
 
+## Fenced writes
+
+A lease elects a writer, but checking "do I still hold the lease?" and uploading are separate steps:
+a writer paused between them (GC, stopped VM, partition) can upload after a new writer took over.
+Fencing makes the replica itself reject those writes. It is an optional `ReplicaClient` capability,
+`registerGeneration(generation: bigint)`, implemented by the PostgreSQL and S3 clients (not the file
+client). Both also take a `generation` option.
+
+A writer taking over a database must, in this order: **register** its generation (higher than any
+previous one), **restore** (or keep a local copy that is at the replica's latest TXID), then
+**write**. Every upload of an older writer either is seen by that restore or is never read.
+
+When a fenced client reports `ErrGenerationSuperseded`, the `Replica` records it (`replica.superseded`)
+and every later write operation (`sync`, `snapshot`, `compact*`, `enforce*Retention*`) fails with it
+without reaching the client; `run()` stops and rejects with it.
+
+### PostgreSQL
+
+`ltx_generations (prefix, generation)` holds the generation. Registering is an upsert that only
+raises it. Every upload and every deletion (`deleteLtxFiles`, `deleteAll`) runs in one transaction
+that starts with `SELECT generation … FOR SHARE` and fails if a higher generation is stored, so a
+registration waits for the transactions in flight and the following ones fail. Fencing is atomic.
+
+### S3
+
+S3 can't check one object and write another in one request. The protocol uses only conditional
+writes (`If-None-Match: *`, `If-Match: <etag>`) and S3's strong read-after-write consistency.
+
+- **`{prefix}/generation.json`** holds `{ generation, fences: [{ generation, txid }] }`
+  (decimal strings).
+- **Register `g`:** (1) read the object, fail if its generation is above `g`, write it with
+  generation `g` conditioned on the ETag read (`If-None-Match: *` if absent), retrying on
+  `412`/`409`. (2) List the replica (with the filter below) and take its latest TXID `T`.
+  (3) Append the fence `(g, T)`, again conditioned on the ETag, failing if a higher generation
+  appeared. Re-registering `g` keeps its first fence. Steps 2 and 3 replace a separate "record `T`
+  after the restore" call: the restore that follows reads exactly the files up to `T`.
+- **Upload (generation `g`):** `PutObject`/`CompleteMultipartUpload` with `If-None-Match: *`
+  and the `ltx-generation: g` metadata. On `412`, `HeadObject` the existing file: a higher
+  generation means this writer is superseded; the same generation (a retried upload), or a lower
+  one that is still part of the replica, holds the same transactions and is kept; otherwise it is a
+  superseded writer's file and is replaced with `If-Match` on its ETag. **Then** the client reads
+  `generation.json` and fails with `ErrGenerationSuperseded` if a higher generation is registered.
+- **Listing:** a file of generation `h` (0 without `ltx-generation`) ending at `maxTXID` is part of
+  the replica unless a fence `(g, T)` has `g > h` and `maxTXID > T`. Only files ending above the
+  lowest fence need their generation (`HeadObject`, cached per key and ETag).
+- **Deletions** (`deleteLtxFiles`, `deleteAll`) read `generation.json` right before each
+  `DeleteObjects` and fail if a higher generation is registered. `deleteAll` keeps
+  `generation.json`.
+
+Guarantees:
+
+1. *An upload that resolves is never lost to a takeover.* It landed before the check read
+   generation `g`, so any higher generation registered after that, and its step 2 listed the file:
+   `T` is at least its `maxTXID`, and no later fence can be lower (each lists the files the previous
+   one kept).
+2. *A superseded writer's upload is never read with data it does not have.* If it lands after the
+   new writer's step 2 and ends above `T`, every listing ignores it once the fence is recorded,
+   which happens before `registerGeneration` resolves, so before the new writer's restore. If it
+   ends at or below `T`, it only holds transactions that the new writer also restored (the old
+   writer's history up to `T` is the replica's), so it is equivalent.
+3. *A TXID range is written once per level.* `If-None-Match: *` stops a superseded writer from
+   overwriting a newer file; only a newer writer replaces an older, ignored one.
+4. A superseded writer learns it on its next upload or deletion; the `Replica` then stops.
+
+Limits:
+
+- **Deletions are best effort.** A `DeleteObjects` sent after the check but executed after a new
+  generation registered still applies. If the old writer's retention deletes files the new writer
+  restores from (for example level-0 files covered by an old writer's level-1 file that the new
+  fence ignores), a later restore can fail with a gap. This needs the old writer to pause between
+  a `GetObject` and the next request.
+- Between step 1 and step 3 of a registration, readers other than the new writer still see the
+  old writer's latest files; once the fence is recorded, those above `T` disappear. They were
+  never acknowledged to the old writer (its upload check failed).
+- The generations must be unique per writer and only grow. `Leaser` generations restart at 1 after
+  a release, so they can't be used as they are.
+- Once fencing is used, unfenced writers to the same prefix are generation 0: their files above the
+  first fence are ignored.
+- Cost: one `GetObject` of `generation.json` per listing and per fenced upload or deletion, and one
+  `HeadObject` per listed file above the lowest fence that the client has not seen before.
+
+---
+
 ## Checksums
 
 - **LTX page checksums & file checksum** use **CRC-64 ISO** (`crc64.MakeTable(crc64.ISO)`), matching
@@ -263,6 +347,8 @@ on the specific subclass) instead of matching message text.
 | `ReplicaURLError` | `ERR_REPLICA_URL` | A replica URL is malformed or uses an unsupported scheme. |
 | `FileReplicaError` | `ERR_FILE_REPLICA` | A local file/backend replica operation failed. |
 | `DatabaseError` | `ERR_DATABASE` | A SQLite database file is missing/invalid or unreadable. |
+| `ErrGenerationSuperseded` | `ERR_GENERATION_SUPERSEDED` | A fenced upload or deletion was rejected: a higher writer generation is registered (carries `generation`). |
+| `ErrReplicaAhead` | `ERR_REPLICA_AHEAD` | `sync()` found the replica ahead of the local database. |
 
 ---
 

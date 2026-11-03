@@ -22,6 +22,35 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `ErrReplicaAhead` (`ERR_REPLICA_AHEAD`), thrown by `sync()` when the replica
   has a higher TXID than the local database, instead of silently not uploading
   the local changes.
+- Fenced writes for S3 (#18): `S3ReplicaClient` implements
+  `registerGeneration()` and takes a `generation` option. Registering raises the
+  generation in a `generation.json` object with conditional writes and records a
+  fence at the replica's latest TXID; fenced uploads use `If-None-Match: *` and
+  carry an `ltx-generation` metadata, and listings ignore files of a superseded
+  writer above the fence. See "Fenced writes" in the README and
+  docs/ARCHITECTURE.md for the protocol and its limits. New exports:
+  `GenerationObjectName`, `GenerationMetadataKey`, `isFenced`,
+  `GenerationState`, `GenerationFence`, and `getGeneration()` /
+  `getGenerationState()` on the client.
+- Fenced deletions: with a generation set, `deleteLtxFiles()` and `deleteAll()`
+  (so compaction and retention) fail with `ErrGenerationSuperseded` once a
+  higher generation is registered. PostgreSQL checks it in the deleting
+  transaction; S3 checks it right before each `DeleteObjects` request.
+- `Replica.superseded`: once a fenced client reports `ErrGenerationSuperseded`,
+  the replica stops writing (every later write operation fails with that
+  error), and `run()` stops and rejects with it instead of retrying.
+- A shared behavior test suite for fencing backends
+  (`test/helpers/fencing-suite.ts`), run against S3 (in-memory fake) and
+  PostgreSQL (when `PG_URL` is set). The in-memory S3 fake honors `If-Match` /
+  `If-None-Match` on writes and reads like S3.
+
+### Changed
+
+- `S3ReplicaClient.deleteAll()` keeps `generation.json`.
+- `S3ReplicaClient` reads `generation.json` once per listing (a 404 when fencing
+  is not used).
+- `PgReplicaClient.deleteLtxFiles()` deletes all the given files in one
+  transaction.
 
 ### Added
 
