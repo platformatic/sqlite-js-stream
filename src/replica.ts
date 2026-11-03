@@ -715,11 +715,18 @@ export class Replica {
   private async uploadLtxFile(level: number, minTXID: bigint, maxTXID: bigint): Promise<FileInfo> {
     const p = (await this.localDb()).ltxPath(level, minTXID, maxTXID);
     // Stream the local LTX file straight to the client (no whole-file buffer).
-    const body = createReadStream(p) as unknown as AsyncIterable<Uint8Array>;
+    const stream = createReadStream(p);
     let info: FileInfo;
     try {
-      info = await this.client.writeLtxFile({ level, minTXID, maxTXID }, body);
+      info = await this.client.writeLtxFile(
+        { level, minTXID, maxTXID },
+        stream as unknown as AsyncIterable<Uint8Array>,
+      );
     } catch (err) {
+      // A client that failed before reading the body leaves the stream open.
+      // Its pending open may still fail (the cache can be removed meanwhile).
+      stream.on('error', () => {});
+      stream.destroy();
       this.noteSuperseded(err);
       throw err;
     }
