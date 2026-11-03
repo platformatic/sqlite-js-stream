@@ -59,12 +59,40 @@ prevents the WAL from being checkpointed past our position.
 4. **Later syncs**: resume the WAL reader from the previous sync's `WALOffset + WALSize` and salts
    (`WALReader.withOffset`). Build a **page map** of committed pages since then and write an
    **incremental** LTX file (only the changed pages, plus any DB-growth pages). If the WAL has been
-   reset (salt/checksum mismatch → `PrevFrameMismatchError`), fall back to a new base snapshot.
+   reset (new salts in the WAL header, or a salt/checksum mismatch → `PrevFrameMismatchError`),
+   fall back to a new base snapshot, unless `Replica.checkpoint()` recorded that the new WAL
+   continues the current position (see below).
 5. Write the LTX file atomically to `<db>-litestream/ltx/0/<txID>-<txID>.ltx`.
 
 > **Reading pages.** Each page is read from the WAL (at `pageMap[pgno] + WALFrameHeaderSize`) if it
 > appears in the committed WAL page map, otherwise from the main database file. This is what makes
 > the read consistent with the pinned read snapshot without copying the whole database.
+
+### Replica.checkpoint()
+
+`checkpoint(conn, mode)` keeps `sync()` incremental across a checkpoint the application controls
+(`wal_autocheckpoint` disabled). After a complete checkpoint the database file holds the state of
+the last sync, and every frame of the next WAL is a change on top of it, so an incremental file
+from offset `WALHeaderSize` of the new WAL is correct. The hard part is proving that the new WAL
+is the one that *directly* followed that checkpoint, since SQLite keeps no link between WAL
+generations.
+
+1. `sync()` (which also uploads), so the position covers every committed frame of the WAL.
+2. Run `PRAGMA wal_checkpoint(RESTART)` on `conn`. Its `log` column is the number of frames in the
+   WAL: if it equals the frames the last sync covered (`(WALOffset + WALSize - WALHeaderSize) /
+   frameSize`), and `busy = 0` and `checkpointed = log`, no commit landed between the sync and
+   the checkpoint, and SQLite guarantees that the next writer starts a new WAL.
+3. Record `{ txid, salt1, salt2, nextSalt1 = salt1 + 1 }` in `<db>-litestream/checkpoint`.
+   SQLite gives a restarted WAL the old salt-1 plus one when the connection writing it has reset
+   the WAL before (it picks random salts otherwise), which is why `conn` must be the writing
+   connection.
+4. For `TRUNCATE`, run `PRAGMA wal_checkpoint(TRUNCATE)` to empty the `-wal` file.
+
+The next `sync()` uses the record only when its resume in the old WAL fails, `txid` is the local
+position, the previous file's salts match, and the new WAL header's salt-1 is `nextSalt1`. Every
+other reset (a checkpoint run directly, an automatic checkpoint, two resets in a row, a WAL started
+by another connection, a crash before the record is written) yields a different salt-1 or no
+record, and falls back to a snapshot. Compaction and restore are unchanged.
 
 ### Replica.snapshot()
 

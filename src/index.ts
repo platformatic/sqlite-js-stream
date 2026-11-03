@@ -18,8 +18,9 @@ export * from './backends/file/index.ts';
 // The DB layer (`src/db.ts`) is intentionally NOT part of the public API.
 // `Replica`/`Store` take a database path and read the DB + WAL directly, so the
 // library is agnostic to whatever SQLite driver the application uses. Only the
-// pluggable read-connection types are exported (see `Replica`'s `openReader`).
-export type { OpenReader, ReaderConnection } from './db.ts';
+// pluggable read-connection types (see `Replica`'s `openReader`) and the
+// checkpoint types (see `Replica.checkpoint`) are exported.
+export type { CheckpointConnection, CheckpointMode, OpenReader, ReaderConnection } from './db.ts';
 export * from './replica.ts';
 export * from './store.ts';
 export * from './leaser.ts';

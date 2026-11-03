@@ -83,6 +83,11 @@ WAL (in `TRUNCATE` mode) or replaces it, resetting the salt. After a checkpoint 
 changes, so a reader that resumes from an old offset/salt detects a **prev-frame mismatch** and must
 start a fresh snapshot.
 
+A restarted WAL gets salt-1 = previous salt-1 + 1 and a random salt-2, but only when the
+connection that writes its first frame has itself reset the WAL before; otherwise both salts are
+random. `Replica.checkpoint()` relies on the former to recognize the WAL that directly followed its
+checkpoint (see `docs/ARCHITECTURE.md`).
+
 ---
 
 ## What this library reads

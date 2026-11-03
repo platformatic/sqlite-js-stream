@@ -8,6 +8,12 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+- `sync()` detects a WAL restarted since the previous sync from the salts in the WAL header. With
+  `RESTART` checkpoints, frames of the old WAL left past the new ones could make it resume at a
+  stale position and skip the new frames until the new WAL grew past it.
+- A level-0 snapshot written by `sync()` records the WAL up to its last commit frame instead of the
+  whole `-wal` file, so the next sync does not skip the frames of a transaction that was being
+  written while the snapshot was taken.
 - Writes made after restoring a database into the replica's own path (for
   example with `ensureExists()` on a new host) are replicated. The local position
   restarted at TXID 1, so `sync()` numbered the new changes with TXIDs the
@@ -19,6 +25,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `Replica.checkpoint(conn, mode = 'TRUNCATE')` syncs, checkpoints the WAL through the
+  application's writing connection (`RESTART` or `TRUNCATE`), and records that the next WAL
+  continues from the synced position, so the next `sync()` writes an incremental LTX file instead
+  of a full snapshot. Any other WAL reset still falls back to a snapshot. New exported types:
+  `CheckpointConnection`, `CheckpointMode`.
 - `ErrReplicaAhead` (`ERR_REPLICA_AHEAD`), thrown by `sync()` when the replica
   has a higher TXID than the local database, instead of silently not uploading
   the local changes.

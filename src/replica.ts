@@ -33,7 +33,7 @@ import {
   type FileInfo,
   type CompactionLevel,
 } from './ltx/index.ts';
-import { LocalDatabase, type OpenReader } from './db.ts';
+import { LocalDatabase, type CheckpointConnection, type CheckpointMode, type OpenReader } from './db.ts';
 import type { ReplicaClient } from './replica-client.ts';
 import { SnapshotLevel } from './replica-client.ts';
 import {
@@ -434,6 +434,33 @@ export class Replica {
       this.posValue = txID;
     }
     return info;
+  }
+
+  /**
+   * Checkpoint syncs (and uploads) the pending WAL frames, then checkpoints the
+   * WAL with `mode` through `conn` and records that the next WAL continues from
+   * the synced position, so the next {@link sync} writes an incremental file
+   * instead of a full snapshot.
+   *
+   * It is meant for applications that disable `wal_autocheckpoint` and decide
+   * when checkpoints run. `conn` must be the application's connection that
+   * writes the database (for example its `DatabaseSync`), with no open
+   * transaction: the WAL is recognized as the one that directly followed the
+   * checkpoint only when the connection that starts it is the one that reset
+   * the WAL. Do not call it concurrently with {@link sync} or {@link run}.
+   *
+   * Returns true when the WAL was fully checkpointed right after the sync and
+   * the continuation was recorded: the next sync is incremental if the next
+   * WAL is started by `conn`. It returns false when a commit
+   * landed between the sync and the checkpoint, or a reader kept the WAL busy:
+   * the next sync resumes in the old WAL if it was not reset, or falls back to
+   * a snapshot if it was. A WAL reset in any other way (a `PRAGMA
+   * wal_checkpoint` run directly by the application, an automatic checkpoint,
+   * or a new WAL started by another connection) also falls back to a snapshot.
+   */
+  async checkpoint(conn: CheckpointConnection, mode: CheckpointMode = 'TRUNCATE'): Promise<boolean> {
+    await this.sync();
+    return (await this.localDb()).checkpoint(conn, mode);
   }
 
   /** SyncAndWait uploads all pending LTX files; harmless if already synced. */
@@ -1025,6 +1052,7 @@ export class Replica {
     await rm(db.ltxDir(), { recursive: true, force: true });
     await mkdir(db.ltxLevelDir(0), { recursive: true });
     await writeFile(db.baseTXIDPath(), `${txID}\n`);
+    await rm(db.checkpointPath(), { force: true });
     this.posValue = null;
   }
 

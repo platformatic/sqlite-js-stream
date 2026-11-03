@@ -285,6 +285,44 @@ replica.run({ intervalMs: 1000, signal: ac.signal }).catch((err) => {
 `Store` also exposes `syncAll()`/`snapshotAll()` for one-shot operations; a continuous
 loop can be driven by calling `replica.run()` per database, or via your own scheduler.
 
+### Checkpoints without full snapshots
+
+When the WAL is reset by a checkpoint, the next `sync()` cannot resume from its previous position
+in the WAL, so it uploads a full snapshot of the database. An application that decides when
+checkpoints run can avoid that with `replica.checkpoint()`: it syncs, checkpoints the WAL, and
+records that the next WAL continues from the synced position, so the next `sync()` uploads only the
+changes.
+
+```ts
+import { DatabaseSync } from 'node:sqlite';
+
+const db = new DatabaseSync('/data/app.db');
+db.exec('PRAGMA journal_mode=WAL');
+db.exec('PRAGMA wal_autocheckpoint=0'); // checkpoints run only through replica.checkpoint()
+
+// ... write with db, and call replica.sync() as usual ...
+
+// Instead of db.exec('PRAGMA wal_checkpoint(TRUNCATE)'):
+const incremental = await replica.checkpoint(db, 'TRUNCATE');
+```
+
+`checkpoint(conn, mode = 'TRUNCATE')` takes the connection the application writes with (`mode` is
+`'RESTART'` or `'TRUNCATE'`):
+
+- Pass the **writing connection**, with no open transaction. SQLite gives the next WAL a predictable
+  salt only when the connection that starts it is the one that reset the WAL; that is how the next
+  `sync()` recognizes the WAL that directly followed the checkpoint.
+- Disable `wal_autocheckpoint` on every connection and never run `PRAGMA wal_checkpoint` yourself:
+  any other reset is detected and the next `sync()` falls back to a full snapshot (correct, but
+  not incremental).
+- Do not call it concurrently with `sync()` or `run()`.
+
+It returns `true` when the WAL was fully checkpointed right after the sync. It returns `false` when
+a commit landed between the sync and the checkpoint, or when a reader kept the checkpoint from
+completing: the next `sync()` then resumes in the old WAL if it was not reset, or uploads a
+snapshot if it was. Restoring across checkpoints works as usual: the incremental files form a
+contiguous TXID chain.
+
 ### Replication from a worker thread
 
 Run `replica.run()` in a **worker thread** so continuous replication doesn't compete with
@@ -379,8 +417,9 @@ Your application is free to use its own SQLite driver and connections (`node:sql
 >   transaction, and the library could read *uncommitted* rows or commit the app's writes), and
 > - if your app had a transaction open, the library could not `BEGIN` its snapshot pin at all.
 >
-> The library has no API to accept an app-owned writable connection, and it deliberately opens its
-> own read-only reader instead. Keep the library's reader and your app's writer on separate
+> The library deliberately opens its own read-only reader instead. The only API that takes your
+> writable connection is `replica.checkpoint()`, which runs `PRAGMA wal_checkpoint` on it and never
+> reads through it. Keep the library's reader and your app's writer on separate
 > connections to the same database file.
 
 ### Large databases & streaming
