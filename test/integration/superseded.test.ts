@@ -1,4 +1,6 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { rmSync } from 'node:fs';
+import { dirname } from 'node:path';
 import assert from 'node:assert/strict';
 
 import {
@@ -29,47 +31,54 @@ class FencedFileClient extends FileReplicaClient {
   }
 }
 
-test('a superseded replica stops writing and run() rejects', async () => {
-  const t = createWALDB(['a']);
-  const client = new FencedFileClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
-  try {
-    await replica.sync();
-    const before = replica.superseded;
-    assert.equal(before, null);
+/**
+ * A database and a replica on a fenced file client. `after` hooks run in the
+ * order they are registered, so the temporary directories are removed after
+ * the replica and the database are closed.
+ */
+function setup(t: TestContext): { db: ReturnType<typeof createWALDB>; client: FencedFileClient; replica: Replica } {
+  const db = createWALDB(['a']);
+  t.after(() => db.close());
+  const replicaDir = makeTempDir('repl-');
+  const client = new FencedFileClient(replicaDir);
+  const replica = new Replica(db.path, client);
+  t.after(() => replica.close());
+  t.after(() => {
+    rmSync(dirname(db.path), { recursive: true, force: true });
+    rmSync(replicaDir, { recursive: true, force: true });
+  });
+  return { db, client, replica };
+}
 
-    client.supersede(7n);
-    t.db.exec("INSERT INTO t (name) VALUES ('b')");
-    await assert.rejects(replica.sync(), ErrGenerationSuperseded);
-    assert.equal(replica.superseded?.generation, 7n);
+test('a superseded replica stops writing and run() rejects', async (t) => {
+  const { db, client, replica } = setup(t);
 
-    // Later operations fail without reaching the client.
-    const writes = client.writes;
-    t.db.exec("INSERT INTO t (name) VALUES ('c')");
-    await assert.rejects(replica.sync(), ErrGenerationSuperseded);
-    await assert.rejects(replica.snapshot(), ErrGenerationSuperseded);
-    await assert.rejects(replica.compact(), ErrGenerationSuperseded);
-    await assert.rejects(replica.enforceRetention(), ErrGenerationSuperseded);
-    assert.equal(client.writes, writes);
+  await replica.sync();
+  const before = replica.superseded;
+  assert.equal(before, null);
 
-    // run() stops instead of retrying, even without an abort signal.
-    await assert.rejects(replica.run({ intervalMs: 10 }), ErrGenerationSuperseded);
-  } finally {
-    replica.close();
-    t.close();
-  }
+  client.supersede(7n);
+  db.db.exec("INSERT INTO t (name) VALUES ('b')");
+  await assert.rejects(replica.sync(), ErrGenerationSuperseded);
+  assert.equal(replica.superseded?.generation, 7n);
+
+  // Later operations fail without reaching the client.
+  const writes = client.writes;
+  db.db.exec("INSERT INTO t (name) VALUES ('c')");
+  await assert.rejects(replica.sync(), ErrGenerationSuperseded);
+  await assert.rejects(replica.snapshot(), ErrGenerationSuperseded);
+  await assert.rejects(replica.compact(), ErrGenerationSuperseded);
+  await assert.rejects(replica.enforceRetention(), ErrGenerationSuperseded);
+  assert.equal(client.writes, writes);
+
+  // run() stops instead of retrying, even without an abort signal.
+  await assert.rejects(replica.run({ intervalMs: 10 }), ErrGenerationSuperseded);
 });
 
-test('run() stops when a sync is superseded', async () => {
-  const t = createWALDB(['a']);
-  const client = new FencedFileClient(makeTempDir('repl-'));
-  const replica = new Replica(t.path, client);
-  try {
-    client.supersede(2n);
-    await assert.rejects(replica.run({ intervalMs: 10 }), { code: 'ERR_GENERATION_SUPERSEDED' });
-    assert.equal(client.writes, 1);
-  } finally {
-    replica.close();
-    t.close();
-  }
+test('run() stops when a sync is superseded', async (t) => {
+  const { client, replica } = setup(t);
+
+  client.supersede(2n);
+  await assert.rejects(replica.run({ intervalMs: 10 }), { code: 'ERR_GENERATION_SUPERSEDED' });
+  assert.equal(client.writes, 1);
 });

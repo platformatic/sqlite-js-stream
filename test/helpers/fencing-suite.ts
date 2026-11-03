@@ -9,10 +9,10 @@
  * `Replica` used here share one copy of the error classes.
  */
 
-import { describe, test, type TestContext } from 'node:test';
+import { after, describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -43,14 +43,21 @@ export interface FencingSuiteOptions {
 
 const superseded = { code: 'ERR_GENERATION_SUPERSEDED' };
 
+/**
+ * Root of the suite's temporary directories, removed by the suite's `after`
+ * hook, which runs once every test's own `t.after` hooks closed the files.
+ */
+let root = '';
+
 function tempDir(name: string): string {
-  return mkdtempSync(join(tmpdir(), `sqlite-js-stream-fencing-${name}-`));
+  return mkdtempSync(join(root, `${name}-`));
 }
 
 /** A WAL-mode database with one row per name, each in its own transaction. */
-function createDB(names: string[]): { path: string; db: DatabaseSync } {
+function createDB(t: TestContext, names: string[]): { path: string; db: DatabaseSync } {
   const path = join(tempDir('db'), 'test.db');
   const db = new DatabaseSync(path);
+  t.after(() => db.close());
   db.exec('PRAGMA journal_mode=WAL');
   db.exec('PRAGMA wal_autocheckpoint=0');
   db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)');
@@ -63,32 +70,31 @@ function insert(db: DatabaseSync, name: string): void {
 }
 
 /** Opens a database restored by a new writer, ready for writes. */
-function openRestored(path: string): DatabaseSync {
+function openRestored(t: TestContext, path: string): DatabaseSync {
   const db = new DatabaseSync(path);
+  t.after(() => db.close());
   db.exec('PRAGMA journal_mode=WAL');
   db.exec('PRAGMA wal_autocheckpoint=0');
   return db;
 }
 
-function names(path: string): string[] {
+function names(t: TestContext, path: string): string[] {
   const db = new DatabaseSync(path, { readOnly: true });
-  try {
-    return (db.prepare('SELECT name FROM t ORDER BY id').all() as Array<{ name: string }>).map((r) => r.name);
-  } finally {
-    db.close();
-  }
+  t.after(() => db.close());
+  return (db.prepare('SELECT name FROM t ORDER BY id').all() as Array<{ name: string }>).map((r) => r.name);
 }
 
 /** Restores the latest state of `prefix` with an unfenced client. */
-async function restoreLatest(backend: FencingBackend, prefix: string): Promise<{ names: string[]; pos: bigint }> {
+async function restoreLatest(
+  t: TestContext,
+  backend: FencingBackend,
+  prefix: string,
+): Promise<{ names: string[]; pos: bigint }> {
   const reader = new Replica(join(tempDir('reader'), 'reader.db'), backend.client(prefix, null));
-  try {
-    const out = join(tempDir('restore'), 'restored.db');
-    await reader.restore({ outputPath: out });
-    return { names: names(out), pos: await reader.calcPos() };
-  } finally {
-    reader.close();
-  }
+  t.after(() => reader.close());
+  const out = join(tempDir('restore'), 'restored.db');
+  await reader.restore({ outputPath: out });
+  return { names: names(t, out), pos: await reader.calcPos() };
 }
 
 /** Lists every LTX file of a level through `client`. */
@@ -131,6 +137,9 @@ export function fencingSuite(
   options: FencingSuiteOptions = {},
 ): void {
   describe(`fenced writes (${name})`, { skip: options.skip }, () => {
+    root = mkdtempSync(join(tmpdir(), 'sqlite-js-stream-fencing-'));
+    after(() => rmSync(root, { recursive: true, force: true }));
+
     test('registerGeneration only raises the generation', async (t) => {
       const backend = setup(t);
       const prefix = backend.prefix();
@@ -147,28 +156,23 @@ export function fencingSuite(
       const backend = setup(t);
       const prefix = backend.prefix();
 
-      const a = createDB(['a1', 'a2']);
+      const a = createDB(t, ['a1', 'a2']);
       const clientA = backend.client(prefix, 1n);
       await clientA.registerGeneration(1n);
       const writerA = new Replica(a.path, clientA);
+      t.after(() => writerA.close());
 
       const pathB = join(tempDir('b'), 'b.db');
       const clientB = backend.client(prefix, 2n);
       const writerB = new Replica(pathB, clientB);
-      let dbB: DatabaseSync | null = null;
-      t.after(() => {
-        writerA.close();
-        writerB.close();
-        dbB?.close();
-        a.db.close();
-      });
+      t.after(() => writerB.close());
 
       await writerA.sync(); // TXID 1
 
       // B takes over: register, restore, write.
       await clientB.registerGeneration(2n);
       await writerB.restore({ outputPath: pathB });
-      dbB = openRestored(pathB);
+      const dbB = openRestored(t, pathB);
       insert(dbB, 'b1');
 
       // A keeps writing: its next sync is rejected, and so is every later one.
@@ -183,31 +187,27 @@ export function fencingSuite(
       const info = await writerB.sync();
       assert.equal(info?.maxTXID, 2n);
 
-      assert.deepEqual(await restoreLatest(backend, prefix), { names: ['a1', 'a2', 'b1'], pos: 2n });
+      assert.deepEqual(await restoreLatest(t, backend, prefix), { names: ['a1', 'a2', 'b1'], pos: 2n });
     });
 
     test('uploads of a superseded writer that land after the takeover are never read', async (t) => {
       const backend = setup(t);
       const prefix = backend.prefix();
 
-      const a = createDB(['a1']);
+      const a = createDB(t, ['a1']);
       const clientA = backend.client(prefix, 1n);
       await clientA.registerGeneration(1n);
       const first = new Replica(a.path, clientA);
+      t.after(() => first.close());
       await first.sync(); // TXID 1
-      first.close();
+      first.close(); // A continues below with another Replica on the same path
 
       const pathB = join(tempDir('b'), 'b.db');
       const clientB = backend.client(prefix, 2n);
       const writerB = new Replica(pathB, clientB);
+      t.after(() => writerB.close());
       const writerA = new Replica(a.path, inFlightClient(backend, prefix, 1n));
-      let dbB: DatabaseSync | null = null;
-      t.after(() => {
-        writerA.close();
-        writerB.close();
-        dbB?.close();
-        a.db.close();
-      });
+      t.after(() => writerA.close());
 
       await clientB.registerGeneration(2n);
       await writerB.restore({ outputPath: pathB });
@@ -218,16 +218,16 @@ export function fencingSuite(
         insert(a.db, n);
         await writerA.sync();
       }
-      assert.deepEqual(await restoreLatest(backend, prefix), { names: ['a1'], pos: 1n });
+      assert.deepEqual(await restoreLatest(t, backend, prefix), { names: ['a1'], pos: 1n });
 
-      dbB = openRestored(pathB);
+      const dbB = openRestored(t, pathB);
       insert(dbB, 'b1');
       await writerB.sync(); // TXID 2
-      assert.deepEqual(await restoreLatest(backend, prefix), { names: ['a1', 'b1'], pos: 2n });
+      assert.deepEqual(await restoreLatest(t, backend, prefix), { names: ['a1', 'b1'], pos: 2n });
 
       insert(dbB, 'b2');
       await writerB.sync(); // TXID 3
-      assert.deepEqual(await restoreLatest(backend, prefix), { names: ['a1', 'b1', 'b2'], pos: 3n });
+      assert.deepEqual(await restoreLatest(t, backend, prefix), { names: ['a1', 'b1', 'b2'], pos: 3n });
 
       // Only B's files are listed above TXID 1.
       const l0 = await list(backend.client(prefix, null), 0);
@@ -238,14 +238,11 @@ export function fencingSuite(
       const backend = setup(t);
       const prefix = backend.prefix();
 
-      const a = createDB(['a1']);
+      const a = createDB(t, ['a1']);
       const clientA = backend.client(prefix, 1n);
       await clientA.registerGeneration(1n);
       const writerA = new Replica(a.path, clientA);
-      t.after(() => {
-        writerA.close();
-        a.db.close();
-      });
+      t.after(() => writerA.close());
       await writerA.sync(); // TXID 1
       insert(a.db, 'a2');
       await writerA.sync(); // TXID 2
@@ -263,21 +260,18 @@ export function fencingSuite(
       await assert.rejects(writerA.compact({ dstLevel: 1 }), superseded);
 
       assert.deepEqual(await list(backend.client(prefix, null), 0), before);
-      assert.deepEqual(await restoreLatest(backend, prefix), { names: ['a1', 'a2'], pos: 2n });
+      assert.deepEqual(await restoreLatest(t, backend, prefix), { names: ['a1', 'a2'], pos: 2n });
     });
 
     test('the current writer can compact and delete', async (t) => {
       const backend = setup(t);
       const prefix = backend.prefix();
 
-      const a = createDB(['a1']);
+      const a = createDB(t, ['a1']);
       const client = backend.client(prefix, 1n);
       await client.registerGeneration(1n);
       const writer = new Replica(a.path, client);
-      t.after(() => {
-        writer.close();
-        a.db.close();
-      });
+      t.after(() => writer.close());
       await writer.sync();
       insert(a.db, 'a2');
       await writer.sync();
@@ -285,7 +279,7 @@ export function fencingSuite(
       const l1 = await writer.compact({ dstLevel: 1 });
       assert.equal(l1?.maxTXID, 2n);
       assert.equal(await writer.enforceRetentionByTXID(0, 2n), 1);
-      assert.deepEqual(await restoreLatest(backend, prefix), { names: ['a1', 'a2'], pos: 2n });
+      assert.deepEqual(await restoreLatest(t, backend, prefix), { names: ['a1', 'a2'], pos: 2n });
     });
   });
 }
