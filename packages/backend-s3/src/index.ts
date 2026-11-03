@@ -9,7 +9,12 @@
 export {
   S3ReplicaClient,
   newReplicaClientFromURL,
+  isFenced,
+  GenerationMetadataKey,
+  GenerationObjectName,
   ReplicaClientType,
+  type GenerationFence,
+  type GenerationState,
   type S3ClientLike,
   type S3ReplicaClientOptions,
 } from './replica-client.ts';
