@@ -77,6 +77,13 @@ from offset `WALHeaderSize` of the new WAL is correct. The hard part is proving 
 is the one that *directly* followed that checkpoint, since SQLite keeps no link between WAL
 generations.
 
+The work is split in two so that replication and the writing connection can live on different
+threads: `prepareCheckpoint()` (replica side) does step 1 and returns a JSON token
+`{ path, txid, salt1, salt2, frames }` read from the local cache; `runCheckpoint(conn, token,
+mode)` (writer side, synchronous) does steps 2-4. `checkpoint()` composes the two. No sync may run
+between them. The record is a file, and `LocalDatabase.sync()` reads it and the local position from
+disk on every call, so a replica on another thread sees it on its next sync.
+
 1. `sync()` (which also uploads), so the position covers every committed frame of the WAL.
 2. Run `PRAGMA wal_checkpoint(RESTART)` on `conn`. Its `log` column is the number of frames in the
    WAL: if it equals the frames the last sync covered (`(WALOffset + WALSize - WALHeaderSize) /

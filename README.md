@@ -316,6 +316,30 @@ const incremental = await replica.checkpoint(db, 'TRUNCATE');
   any other reset is detected and the next `sync()` falls back to a full snapshot (correct, but
   not incremental).
 - Do not call it concurrently with `sync()` or `run()`.
+- The next WAL must be started by the same connection: a different connection that writes first
+  picks random salts, and the next `sync()` falls back to a snapshot.
+
+When replication runs on a different thread (or process) than the writing connection, which
+cannot cross threads, split the call in two. `replica.prepareCheckpoint()` syncs and returns a
+plain JSON token; send it to the writing thread and pass it to `runCheckpoint()` with the
+connection:
+
+```ts
+// Replication thread:
+const token = await replica.prepareCheckpoint(); // { path, txid, salt1, salt2, frames }
+port.postMessage({ type: 'checkpoint', token });
+
+// Writing thread (owns `db`), between transactions:
+import { runCheckpoint } from '@platformatic/sqlite-js-stream';
+const incremental = runCheckpoint(db, token, 'TRUNCATE'); // synchronous
+```
+
+`runCheckpoint()` writes the record into `<db>-litestream/` next to the database, and the
+replica's next `sync()` reads it from disk, so the two sides share nothing else. No `sync()` of
+the database may run between `prepareCheckpoint()` and `runCheckpoint()`, and the writing thread
+must not commit between receiving the token and calling `runCheckpoint()`; a commit makes the
+checkpoint return `false`, which is safe but not incremental. `replica.checkpoint(conn, mode)` is
+`prepareCheckpoint()` followed by `runCheckpoint()`.
 
 It returns `true` when the WAL was fully checkpointed right after the sync. It returns `false` when
 a commit landed between the sync and the checkpoint, or when a reader kept the checkpoint from
@@ -418,8 +442,8 @@ Your application is free to use its own SQLite driver and connections (`node:sql
 > - if your app had a transaction open, the library could not `BEGIN` its snapshot pin at all.
 >
 > The library deliberately opens its own read-only reader instead. The only API that takes your
-> writable connection is `replica.checkpoint()`, which runs `PRAGMA wal_checkpoint` on it and never
-> reads through it. Keep the library's reader and your app's writer on separate
+> writable connection is the checkpoint (`replica.checkpoint()` / `runCheckpoint()`), which runs
+> `PRAGMA wal_checkpoint` on it and never reads through it. Keep the library's reader and your app's writer on separate
 > connections to the same database file.
 
 ### Large databases & streaming

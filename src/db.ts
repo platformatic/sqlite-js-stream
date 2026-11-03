@@ -11,7 +11,8 @@
  */
 
 import { DatabaseSync } from 'node:sqlite';
-import { open, readFile, readdir, rename, rm, stat, writeFile, type FileHandle } from 'node:fs/promises';
+import { rmSync, writeFileSync } from 'node:fs';
+import { open, readFile, readdir, rename, rm, stat, type FileHandle } from 'node:fs/promises';
 import nodePath from 'node:path';
 
 import {
@@ -57,7 +58,7 @@ export type OpenReader = (path: string) => ReaderConnection;
 
 /**
  * CheckpointConnection is the minimal read-write SQLite connection used by
- * {@link LocalDatabase.checkpoint} to run `PRAGMA wal_checkpoint`. A
+ * {@link runCheckpoint} to run `PRAGMA wal_checkpoint`. A
  * `node:sqlite` `DatabaseSync` satisfies it. It must not have an open
  * transaction.
  */
@@ -73,6 +74,27 @@ export interface CheckpointConnection {
 export type CheckpointMode = 'RESTART' | 'TRUNCATE';
 
 /**
+ * CheckpointToken describes the position of the last sync, for
+ * {@link runCheckpoint}. It is plain JSON, so it can be sent to the thread or
+ * process that owns the writing connection.
+ */
+export interface CheckpointToken {
+  /** Path of the database. */
+  path: string;
+  /** Local TXID of the last sync, as a decimal string. */
+  txid: string;
+  /** WAL salts recorded by the last sync. */
+  salt1: number;
+  salt2: number;
+  /**
+   * Number of WAL frames the last sync covered; 0 when it does not cover a
+   * known WAL, in which case the checkpoint cannot keep the next sync
+   * incremental.
+   */
+  frames: number;
+}
+
+/**
  * The record left by a checkpoint that reset the WAL right after a sync: the
  * next WAL (the one with `nextSalt1`) holds only changes on top of `txid`.
  */
@@ -81,6 +103,67 @@ interface CheckpointRecord {
   salt1: number;
   salt2: number;
   nextSalt1: number;
+}
+
+/** Path of the checkpoint record of the database at `path`. */
+function checkpointRecordPath(path: string): string {
+  return nodePath.join(`${path}-litestream`, 'checkpoint');
+}
+
+/**
+ * RunCheckpoint checkpoints the WAL of `token.path` with `mode` through `conn`,
+ * the connection that writes the database (with no open transaction), and,
+ * if the WAL held exactly the frames of the sync described by `token`,
+ * records that the next WAL continues from it. Returns whether it recorded it.
+ *
+ * It is synchronous, so no write on the calling thread can land between the
+ * checkpoint and the record. No sync of the database may run between the
+ * call that produced `token` and this one.
+ *
+ * The checkpoint runs as `RESTART` first: its `log` column (the number of
+ * frames in the WAL) proves that no commit landed between the sync and the
+ * checkpoint, and a complete `RESTART` guarantees that the next write starts
+ * a new WAL. SQLite gives that WAL the old salt-1 plus one when the connection
+ * that starts it has reset the WAL before (as `conn` just did); the next sync
+ * accepts the new WAL only with that salt-1. Any other reset (another
+ * checkpoint, or a WAL started by a different connection, which picks random
+ * salts) falls back to a snapshot. `TRUNCATE` then truncates the `-wal` file.
+ */
+export function runCheckpoint(
+  conn: CheckpointConnection,
+  token: CheckpointToken,
+  mode: CheckpointMode = 'TRUNCATE',
+): boolean {
+  if (mode !== 'RESTART' && mode !== 'TRUNCATE') {
+    throw new DatabaseError(`unsupported checkpoint mode: ${mode}`);
+  }
+  const recordPath = checkpointRecordPath(token.path);
+  rmSync(recordPath, { force: true });
+
+  const r = conn.prepare('PRAGMA wal_checkpoint(RESTART)').get() as {
+    busy: number;
+    log: number;
+    checkpointed: number;
+  };
+  const complete =
+    token.frames > 0 && r.busy === 0 && r.log === token.frames && r.checkpointed === token.frames;
+
+  if (complete) {
+    const record = {
+      txid: token.txid,
+      salt1: token.salt1,
+      salt2: token.salt2,
+      nextSalt1: (token.salt1 + 1) >>> 0,
+    };
+    writeFileSync(recordPath, `${JSON.stringify(record)}\n`);
+  }
+
+  if (mode === 'TRUNCATE') {
+    // Whatever the outcome, the next WAL is the one recorded above (or a
+    // later one, which falls back to a snapshot).
+    conn.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+  }
+  return complete;
 }
 
 function defaultOpenReader(path: string): ReaderConnection {
@@ -160,10 +243,10 @@ export class LocalDatabase {
 
   /**
    * CheckpointPath returns the path of the file recording that a checkpoint
-   * reset the WAL right after a sync (see {@link checkpoint}).
+   * reset the WAL right after a sync (see {@link runCheckpoint}).
    */
   checkpointPath(): string {
-    return nodePath.join(this.metaPath, 'checkpoint');
+    return checkpointRecordPath(this.path);
   }
 
   /** Returns the checkpoint record, or null if there is none. */
@@ -318,7 +401,7 @@ export class LocalDatabase {
       if (!snapshotting && prev !== null) {
         reader = makeResumeReader(walBuf, prev.walOffset + prev.walSize, prev.salt1, prev.salt2);
         if (reader === null && (await this.checkpointed(pos, prev))) {
-          // The WAL was reset by checkpoint() right after the previous sync:
+          // The WAL was reset by runCheckpoint() right after the previous sync:
           // the database file holds the state at `pos`, and every frame of the
           // new WAL is a change on top of it.
           if (walBuf.length < WALHeaderSize) return null; // no new WAL yet
@@ -472,68 +555,28 @@ export class LocalDatabase {
   }
 
   /**
-   * Checkpoint checkpoints the WAL with `mode` through `conn`, the application
-   * connection that writes the database. The caller must have synced first.
-   *
-   * If the WAL holds exactly the frames covered by the last sync, and the
-   * checkpoint copied all of them into the database file, it records that the
-   * next WAL continues from the current position, so the next sync writes an
-   * incremental file instead of a snapshot. Returns whether it recorded it.
-   *
-   * The checkpoint runs as `RESTART` first: its `log` column (the number of
-   * frames in the WAL) proves that no commit landed between the last sync and
-   * the checkpoint, and a complete `RESTART` guarantees that the next write
-   * starts a new WAL. SQLite gives that WAL the old salt-1 plus one when the
-   * connection that starts it has reset the WAL before (as `conn` just did);
-   * the next sync accepts the new WAL only with that salt-1. Any other reset
-   * (another checkpoint, or a WAL started by a different connection, which
-   * picks random salts) falls back to a snapshot. `TRUNCATE` then truncates
-   * the `-wal` file.
+   * CheckpointToken describes the position of the last sync for
+   * {@link runCheckpoint}. The caller must have synced first. It reads the
+   * local cache only, so it can be called from a different thread than the
+   * one running the checkpoint.
    */
-  async checkpoint(conn: CheckpointConnection, mode: CheckpointMode = 'TRUNCATE'): Promise<boolean> {
-    if (mode !== 'RESTART' && mode !== 'TRUNCATE') {
-      throw new DatabaseError(`unsupported checkpoint mode: ${mode}`);
-    }
+  async checkpointToken(): Promise<CheckpointToken> {
     const pos = await this.pos();
     const prev = await this.prevSyncInfo();
-
-    await rm(this.checkpointPath(), { force: true });
-    const r = conn.prepare('PRAGMA wal_checkpoint(RESTART)').get() as {
-      busy: number;
-      log: number;
-      checkpointed: number;
-    };
-
     // The frames the last sync covered, all in the WAL with prev's salts.
     const end = prev === null ? 0 : prev.walOffset + prev.walSize;
     const frames = (end - WALHeaderSize) / (this.pageSize + WALFrameHeaderSize);
-    const complete =
-      prev !== null &&
-      end > WALHeaderSize &&
-      r.busy === 0 &&
-      r.log === frames &&
-      r.checkpointed === frames;
-
-    if (complete) {
-      const record = {
-        txid: String(pos),
-        salt1: prev.salt1,
-        salt2: prev.salt2,
-        nextSalt1: (prev.salt1 + 1) >>> 0,
-      };
-      await writeFile(this.checkpointPath(), `${JSON.stringify(record)}\n`);
-    }
-
-    if (mode === 'TRUNCATE') {
-      // Whatever the outcome, the next WAL is the one recorded above (or a
-      // later one, which falls back to a snapshot).
-      conn.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
-    }
-    return complete;
+    return {
+      path: this.path,
+      txid: String(pos),
+      salt1: prev?.salt1 ?? 0,
+      salt2: prev?.salt2 ?? 0,
+      frames: prev !== null && end > WALHeaderSize && Number.isInteger(frames) ? frames : 0,
+    };
   }
 
   /**
-   * Reports whether the WAL was reset by {@link checkpoint} right after the
+   * Reports whether the WAL was reset by {@link runCheckpoint} right after the
    * sync that wrote the file at `pos` described by `prev`.
    */
   private async checkpointed(

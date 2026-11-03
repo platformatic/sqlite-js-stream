@@ -28,8 +28,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `Replica.checkpoint(conn, mode = 'TRUNCATE')` syncs, checkpoints the WAL through the
   application's writing connection (`RESTART` or `TRUNCATE`), and records that the next WAL
   continues from the synced position, so the next `sync()` writes an incremental LTX file instead
-  of a full snapshot. Any other WAL reset still falls back to a snapshot. New exported types:
-  `CheckpointConnection`, `CheckpointMode`.
+  of a full snapshot. Any other WAL reset still falls back to a snapshot. When replication runs on
+  another thread than the writing connection, `Replica.prepareCheckpoint()` syncs and returns a
+  JSON-serializable `CheckpointToken`, and the exported `runCheckpoint(conn, token, mode)` runs the
+  checkpoint on the writing thread. New exported types: `CheckpointConnection`, `CheckpointMode`,
+  `CheckpointToken`.
 - `ErrReplicaAhead` (`ERR_REPLICA_AHEAD`), thrown by `sync()` when the replica
   has a higher TXID than the local database, instead of silently not uploading
   the local changes.

@@ -33,7 +33,14 @@ import {
   type FileInfo,
   type CompactionLevel,
 } from './ltx/index.ts';
-import { LocalDatabase, type CheckpointConnection, type CheckpointMode, type OpenReader } from './db.ts';
+import {
+  LocalDatabase,
+  runCheckpoint,
+  type CheckpointConnection,
+  type CheckpointMode,
+  type CheckpointToken,
+  type OpenReader,
+} from './db.ts';
 import type { ReplicaClient } from './replica-client.ts';
 import { SnapshotLevel } from './replica-client.ts';
 import {
@@ -440,7 +447,9 @@ export class Replica {
    * Checkpoint syncs (and uploads) the pending WAL frames, then checkpoints the
    * WAL with `mode` through `conn` and records that the next WAL continues from
    * the synced position, so the next {@link sync} writes an incremental file
-   * instead of a full snapshot.
+   * instead of a full snapshot. It is {@link prepareCheckpoint} followed by
+   * {@link runCheckpoint}, for applications that write and replicate on the
+   * same thread.
    *
    * It is meant for applications that disable `wal_autocheckpoint` and decide
    * when checkpoints run. `conn` must be the application's connection that
@@ -451,16 +460,26 @@ export class Replica {
    *
    * Returns true when the WAL was fully checkpointed right after the sync and
    * the continuation was recorded: the next sync is incremental if the next
-   * WAL is started by `conn`. It returns false when a commit
-   * landed between the sync and the checkpoint, or a reader kept the WAL busy:
-   * the next sync resumes in the old WAL if it was not reset, or falls back to
-   * a snapshot if it was. A WAL reset in any other way (a `PRAGMA
-   * wal_checkpoint` run directly by the application, an automatic checkpoint,
-   * or a new WAL started by another connection) also falls back to a snapshot.
+   * WAL is started by `conn`. It returns false when a commit landed between
+   * the sync and the checkpoint, or a reader kept the WAL busy: the next sync
+   * resumes in the old WAL if it was not reset, or falls back to a snapshot if
+   * it was. A WAL reset in any other way (a `PRAGMA wal_checkpoint` run
+   * directly by the application, an automatic checkpoint, or a new WAL started
+   * by another connection) also falls back to a snapshot.
    */
   async checkpoint(conn: CheckpointConnection, mode: CheckpointMode = 'TRUNCATE'): Promise<boolean> {
+    return runCheckpoint(conn, await this.prepareCheckpoint(), mode);
+  }
+
+  /**
+   * PrepareCheckpoint syncs (and uploads) the pending WAL frames and returns a
+   * JSON-serializable token describing the synced position, to pass to
+   * {@link runCheckpoint} on the thread that owns the writing connection. No
+   * {@link sync} of this database may run until `runCheckpoint` returns.
+   */
+  async prepareCheckpoint(): Promise<CheckpointToken> {
     await this.sync();
-    return (await this.localDb()).checkpoint(conn, mode);
+    return (await this.localDb()).checkpointToken();
   }
 
   /** SyncAndWait uploads all pending LTX files; harmless if already synced. */

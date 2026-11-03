@@ -1,10 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
+import { Worker } from 'node:worker_threads';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import { Decoder, Replica, FileReplicaClient, WALHeaderSize } from '../../src/index.ts';
+import {
+  Decoder,
+  Replica,
+  FileReplicaClient,
+  WALHeaderSize,
+  runCheckpoint,
+  type CheckpointToken,
+} from '../../src/index.ts';
 import { LocalDatabase } from '../../src/db.ts';
 import { createWALDB, makeTempDir, type TestDB } from '../helpers/make-db.ts';
 
@@ -88,6 +96,66 @@ test('sync stays incremental after checkpoint(TRUNCATE)', async () => {
   } finally {
     db.close();
     replica.close();
+    t.close();
+  }
+});
+
+test('prepareCheckpoint in a replication thread, runCheckpoint on the writer', async () => {
+  const t = createWALDB(['a']);
+  fill(t, 100, 'base');
+  const clientPath = makeTempDir('repl-');
+  const worker = new Worker(new URL('../helpers/replication-worker.ts', import.meta.url));
+  let nextId = 0;
+  const call = (type: string, extra: object = {}): Promise<unknown> => {
+    const id = nextId++;
+    return new Promise((resolve, reject) => {
+      const onMessage = (m: { id: number; result?: unknown; error?: string }) => {
+        if (m.id !== id) return;
+        worker.off('message', onMessage);
+        if (m.error !== undefined) reject(new Error(m.error));
+        else resolve(m.result);
+      };
+      worker.on('message', onMessage);
+      worker.postMessage({ id, type, ...extra });
+    });
+  };
+  const db = await LocalDatabase.open(t.path);
+  try {
+    await call('open', { dbPath: t.path, clientPath });
+    await call('sync');
+    const snap = await summarize(db, 1n);
+
+    for (let i = 0; i < 3; i++) {
+      // The token crosses threads as plain data.
+      const token = (await call('prepareCheckpoint')) as CheckpointToken;
+      assert.deepEqual(JSON.parse(JSON.stringify(token)), token);
+      assert.equal(runCheckpoint(t.db, token, 'TRUNCATE'), true);
+
+      t.db.exec(`UPDATE t SET name = 'upd-${i}' WHERE id = ${i + 1}`);
+      fill(t, 5, `round-${i}`);
+      // The worker's Replica (and its cached positions) picks up the record.
+      assert.deepEqual(await call('sync'), { level: 0, maxTXID: String(i + 2) });
+    }
+
+    const files = await db.l0Files();
+    assert.deepEqual(files.map((f) => f.maxTXID), [1n, 2n, 3n, 4n]);
+    for (const f of files.slice(1)) {
+      const s = await summarize(db, f.maxTXID);
+      assert.equal(s.walOffset, BigInt(WALHeaderSize));
+      assert.ok(s.pages < snap.pages, `TXID ${f.maxTXID} is incremental (${s.pages} pages)`);
+    }
+
+    await call('close');
+    // A separate Replica, sharing nothing with the worker, restores the data.
+    const reader = new Replica(t.path, new FileReplicaClient(clientPath));
+    try {
+      await assertRestoreMatches(reader, t);
+    } finally {
+      reader.close();
+    }
+  } finally {
+    await worker.terminate();
+    db.close();
     t.close();
   }
 });
@@ -208,7 +276,7 @@ test('a commit between the sync and the checkpoint produces a snapshot', async (
     await db.sync();
     // Not synced: the checkpoint would move it into the database file.
     t.db.exec("INSERT INTO t (name) VALUES ('unsynced')");
-    assert.equal(await db.checkpoint(t.db, 'TRUNCATE'), false);
+    assert.equal(runCheckpoint(t.db, await db.checkpointToken(), 'TRUNCATE'), false);
 
     t.db.exec("INSERT INTO t (name) VALUES ('after')");
     await db.sync();
