@@ -16,6 +16,7 @@ export {
   type GenerationFence,
   type GenerationState,
   type S3ClientLike,
+  type S3DeletePrefixOptions,
   type S3ReplicaClientOptions,
 } from './replica-client.ts';
 

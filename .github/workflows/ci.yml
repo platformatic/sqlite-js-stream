@@ -46,6 +46,15 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: pnpm
 
+      - name: Start an S3-compatible store
+        run: |
+          docker run -d --name s3 -p 9000:9000 -e RUSTFS_ACCESS_KEY=sqlite-js-stream -e RUSTFS_SECRET_KEY=sqlite-js-stream-secret rustfs/rustfs:1.0.1
+          until curl -s -o /dev/null http://127.0.0.1:9000; do sleep 1; done
+          echo "S3_ENDPOINT=http://127.0.0.1:9000" >> "$GITHUB_ENV"
+          echo "AWS_REGION=us-east-1" >> "$GITHUB_ENV"
+          echo "AWS_ACCESS_KEY_ID=sqlite-js-stream" >> "$GITHUB_ENV"
+          echo "AWS_SECRET_ACCESS_KEY=sqlite-js-stream-secret" >> "$GITHUB_ENV"
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 

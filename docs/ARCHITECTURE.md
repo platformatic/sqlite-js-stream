@@ -350,6 +350,29 @@ Limits:
 - Cost: one `GetObject` of `generation.json` per listing and per fenced upload or deletion, and one
   `HeadObject` per listed file above the lowest fence that the client has not seen before.
 
+### Deleting a prefix
+
+`deleteAll()` keeps the generation so that a superseded writer stays fenced, which makes it unfit
+to delete replicas for good: a new writer of the same prefix could not register a lower generation.
+The static `deletePrefix()` of each client deletes the replica at a prefix and every replica under
+`prefix/`, generation and lease records included, optionally fenced on a `generation` (it fails
+with `ErrGenerationSuperseded` if a replica has a higher one):
+
+- **PostgreSQL:** one transaction. It locks the matching `ltx_generations` rows `FOR UPDATE` (in
+  prefix order), so it waits for the fenced transactions holding them `FOR SHARE`, and fenced
+  uploads, deletions and registrations that start meanwhile wait for it. With a generation, it
+  fails before deleting anything. It then deletes the rows of `ltx_chunks`, `ltx_files`,
+  `ltx_generations` and `ltx_leases`. Given a transaction, it runs in a savepoint.
+- **S3:** one listing of `prefix/`, deleting every object with `DeleteObjects` except the
+  `generation.json` objects, which are deleted last. With a generation, each replica's
+  `generation.json` is read before deleting its first object and again before the final deletion.
+  Best effort, like other S3 deletions.
+- **File:** the directory is removed.
+
+After the deletion, the former writers are no longer fenced (there is no generation to compare
+with), so they must be stopped first. A replica created under the prefix while the deletion runs
+may be partly deleted.
+
 ---
 
 ## Checksums

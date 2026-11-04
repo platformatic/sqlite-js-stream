@@ -319,6 +319,51 @@ directory:
 
 The file backend does not implement fenced writes.
 
+### Deleting every replica under a prefix
+
+`deleteAll()` deletes the files of one replica and keeps its generation, so a
+superseded writer stays fenced. To delete a whole group of replicas, for
+example every database of a tenant, each client has a static `deletePrefix()`.
+It deletes the replica at the prefix and every replica under `prefix/` (`a`
+covers `a` and `a/b`, not `ab`), with their generations and leases, and resolves
+with the sorted prefixes (paths for the file backend) of the deleted replicas:
+
+```ts
+import { FileReplicaClient } from '@platformatic/sqlite-js-stream';
+import { PgReplicaClient } from '@platformatic/sqlite-js-stream-pg';
+import { S3ReplicaClient } from '@platformatic/sqlite-js-stream-s3';
+
+await FileReplicaClient.deletePrefix({ path: '/backups/tenant-1' });
+await PgReplicaClient.deletePrefix({ sql, prefix: 'tenant-1', tablePrefix: 'ltx' });
+await S3ReplicaClient.deletePrefix({ bucket: 'my-bucket', prefix: 'tenant-1', client });
+// => ['tenant-1/db1', 'tenant-1/db2']
+```
+
+The options take the same connection settings as the client's constructor (`url`
+or `sql`, `schema` and `tablePrefix` for PostgreSQL; `client` or `region`,
+`endpoint` and credentials for S3). An empty prefix is rejected.
+
+With a `generation` option, the deletion is fenced like the deletions of a fenced
+client: it fails with `ErrGenerationSuperseded` if a replica under the prefix has
+a higher generation.
+
+- **PostgreSQL** deletes everything in one transaction that first locks the
+  generation rows (`FOR UPDATE`): it waits for the fenced uploads and deletions
+  in flight, the ones that start meanwhile wait for it, and a superseded
+  deletion deletes nothing. Pass a transaction as `sql` (the argument of a
+  `sql.begin()` callback) to run the deletion in a savepoint of it, so it commits
+  or rolls back with the caller's own changes.
+- **S3** is best effort: the generation of each replica is checked before
+  deleting its first object and again before the generation objects, which are
+  deleted last, so former writers stay fenced while the files are deleted. A
+  generation registered between a check and a `DeleteObjects` request does not
+  stop the deletion, and a superseded deletion keeps what it already deleted.
+- **The file backend** has no generations: the directory is removed.
+
+Once the generations are deleted, nothing fences the former writers of these
+replicas: a writer still running can upload again and create its replica anew.
+Stop the writers first.
+
 ### Continuous sync
 
 For ongoing replication, `replica.run()` syncs immediately and then repeats on an

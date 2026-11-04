@@ -12,6 +12,7 @@ export {
   PgReplicaClient,
   newReplicaClientFromURL,
   ReplicaClientType,
+  type PgDeletePrefixOptions,
   type PgReplicaClientOptions,
 } from './replica-client.ts';
 

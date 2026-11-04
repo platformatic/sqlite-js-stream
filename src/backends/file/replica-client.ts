@@ -29,8 +29,41 @@ import type { Logger } from '../../util/logger.ts';
 import { FileReplicaError, InvalidArgumentError } from '../../errors.ts';
 import { noopLogger } from '../../util/logger.ts';
 import { registerReplicaClientFactory } from '../../replica-url.ts';
+import { DefaultLeasePath } from '../../leaser.ts';
 
 export const ReplicaClientType = 'file';
+
+/** Configuration for {@link FileReplicaClient.deletePrefix}. */
+export interface FileDeletePrefixOptions {
+  /**
+   * Directory to delete: the replica at this path and every replica under it.
+   * Must not be empty.
+   */
+  path: string;
+}
+
+/**
+ * Returns the replica directories at or under `dir` (those holding an `ltx`
+ * directory or a lease file), without following symbolic links.
+ */
+async function findReplicaDirs(dir: string, out: string[]): Promise<void> {
+  let entries;
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return;
+    throw err;
+  }
+  if (entries.some((e) => (e.name === 'ltx' && e.isDirectory()) || (e.name === DefaultLeasePath && e.isFile()))) {
+    out.push(dir);
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory() && entry.name !== 'ltx') {
+      await findReplicaDirs(nodePath.join(dir, entry.name), out);
+    }
+  }
+}
 
 /** FileReplicaClient writes LTX files to a local directory. */
 export class FileReplicaClient implements ReplicaClient {
@@ -208,6 +241,23 @@ export class FileReplicaClient implements ReplicaClient {
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
       }
     }
+  }
+
+  /**
+   * Deletes every replica under a directory: the replica at `path` and every
+   * replica in its subdirectories, removing the whole directory (lease files
+   * included). Resolves with the sorted paths of the deleted replicas (those
+   * holding an `ltx` directory or a lease file). The file backend has no
+   * generations, so the deletion is not fenced.
+   */
+  static async deletePrefix(opts: FileDeletePrefixOptions): Promise<string[]> {
+    if (!opts.path) {
+      throw new InvalidArgumentError('file replica client: deletePrefix requires a non-empty path');
+    }
+    const replicas: string[] = [];
+    await findReplicaDirs(opts.path, replicas);
+    await rm(opts.path, { recursive: true, force: true });
+    return replicas.sort();
   }
 
   async deleteAll(): Promise<void> {

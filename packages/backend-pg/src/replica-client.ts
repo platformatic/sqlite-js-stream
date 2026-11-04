@@ -20,7 +20,7 @@
 
 import { Readable } from 'node:stream';
 
-import postgres, { type ISql, type Sql } from 'postgres';
+import postgres, { type ISql, type Sql, type TransactionSql } from 'postgres';
 
 import { withDdlLock } from './ddl.ts';
 
@@ -69,6 +69,37 @@ export interface PgReplicaClientOptions {
   generation?: bigint | null;
   /** Max pool connections, passed through to `postgres()`. */
   max?: number;
+}
+
+/** Configuration for {@link PgReplicaClient.deletePrefix}. */
+export interface PgDeletePrefixOptions {
+  /**
+   * PostgreSQL connection URL. Required unless a {@link sql} client is
+   * injected; the connection is closed before the deletion resolves.
+   */
+  url?: string;
+  /**
+   * Injected `postgres()` client, or a transaction (`sql.begin()` callback
+   * argument): the deletion then runs in a savepoint of that transaction and
+   * commits or rolls back with it.
+   */
+  sql?: Sql | TransactionSql;
+  /**
+   * Prefix to delete: the replica at this prefix and every replica under
+   * `prefix/` (`a` covers `a` and `a/b`, not `ab`). Leading/trailing slashes
+   * are normalized away. Must not be empty.
+   */
+  prefix: string;
+  /** Schema holding the LTX tables. Defaults to `public`. */
+  schema?: string;
+  /** Base table-name prefix. Defaults to `ltx`. */
+  tablePrefix?: string;
+  /**
+   * Fences the deletion: it fails with {@link ErrGenerationSuperseded}, and
+   * deletes nothing, if a replica under the prefix has a higher registered
+   * generation. `null` (the default) deletes unconditionally.
+   */
+  generation?: bigint | null;
 }
 
 /** Normalized base prefix (no leading/trailing slash, `''` when empty). */
@@ -503,6 +534,115 @@ export class PgReplicaClient implements ReplicaClient {
         `;
       }
     });
+  }
+
+  /**
+   * Deletes every replica under a prefix: the replica at `prefix` and every
+   * replica under `prefix/`, with their LTX files, generation rows and lease
+   * rows (unlike {@link deleteAll}, which keeps the generation). Resolves with
+   * the sorted prefixes of the deleted replicas (empty when there were none,
+   * or when the tables do not exist).
+   *
+   * Everything is deleted in one transaction that first locks the generation
+   * rows of the matching replicas (`FOR UPDATE`): it waits for the fenced
+   * uploads and deletions in flight on them, which hold the rows `FOR SHARE`,
+   * and the ones that start meanwhile, and `registerGeneration` calls, wait
+   * for it to commit. With {@link PgDeletePrefixOptions.generation}, the
+   * transaction fails with {@link ErrGenerationSuperseded} before deleting
+   * anything if one of those rows holds a higher generation.
+   *
+   * Once the deletion commits, the replicas have no generation, so nothing
+   * fences their former writers anymore: a writer that is still running can
+   * upload again and create the replica anew. Stop the writers first.
+   */
+  static async deletePrefix(opts: PgDeletePrefixOptions): Promise<string[]> {
+    if (!opts.url && !opts.sql) {
+      throw new InvalidArgumentError('pg replica client: either url or sql is required');
+    }
+    const prefix = normalizePrefix(opts.prefix ?? '');
+    if (prefix === '') {
+      throw new InvalidArgumentError('pg replica client: deletePrefix requires a non-empty prefix');
+    }
+    const schema = opts.schema ?? 'public';
+    const tablePrefix = opts.tablePrefix ?? 'ltx';
+    for (const ident of [schema, tablePrefix]) {
+      if (!IDENT_RE.test(ident)) {
+        throw new InvalidArgumentError(
+          `pg replica client: invalid identifier "${ident}" (schema/tablePrefix must be plain SQL identifiers)`,
+        );
+      }
+    }
+    const generation = opts.generation ?? null;
+    const table = (name: string): string => `${schema}.${tablePrefix}_${name}`;
+    const under = `${prefix}/`;
+
+    const run = async (tx: ISql): Promise<string[]> => {
+      const [exists] = await tx`
+        SELECT to_regclass(${table('files')}) IS NOT NULL AS files,
+               to_regclass(${table('leases')}) IS NOT NULL AS leases
+      `;
+      const replicas = new Set<string>();
+
+      if (exists.files) {
+        const generations = await tx`
+          SELECT prefix, generation FROM ${tx(table('generations'))}
+          WHERE prefix = ${prefix} OR starts_with(prefix, ${under})
+          ORDER BY prefix
+          FOR UPDATE
+        `;
+        if (generation !== null) {
+          let highest: bigint | null = null;
+          for (const row of generations) {
+            const stored = BigInt(row.generation);
+            if (stored > generation && (highest === null || stored > highest)) highest = stored;
+          }
+          if (highest !== null) throw new ErrGenerationSuperseded(highest);
+        }
+        for (const row of generations) replicas.add(row.prefix);
+
+        const files = await tx`
+          SELECT DISTINCT prefix FROM ${tx(table('files'))}
+          WHERE prefix = ${prefix} OR starts_with(prefix, ${under})
+        `;
+        for (const row of files) replicas.add(row.prefix);
+
+        await tx`
+          DELETE FROM ${tx(table('chunks'))}
+          WHERE prefix = ${prefix} OR starts_with(prefix, ${under})
+        `;
+        await tx`
+          DELETE FROM ${tx(table('files'))}
+          WHERE prefix = ${prefix} OR starts_with(prefix, ${under})
+        `;
+        await tx`
+          DELETE FROM ${tx(table('generations'))}
+          WHERE prefix = ${prefix} OR starts_with(prefix, ${under})
+        `;
+      }
+
+      if (exists.leases) {
+        const leases = await tx`
+          DELETE FROM ${tx(table('leases'))}
+          WHERE prefix = ${prefix} OR starts_with(prefix, ${under})
+          RETURNING prefix
+        `;
+        for (const row of leases) replicas.add(row.prefix);
+      }
+
+      return [...replicas].sort();
+    };
+
+    if (opts.sql !== undefined) {
+      const sql = opts.sql;
+      if ('savepoint' in sql) return sql.savepoint(run) as Promise<string[]>;
+      return sql.begin(run) as Promise<string[]>;
+    }
+    const sql = postgres(opts.url!, { max: 1, onnotice: () => {} });
+    try {
+      return await (sql.begin(run) as Promise<string[]>);
+    } finally {
+      await sql.end({ timeout: 1 });
+    }
   }
 
   /** Deletes every LTX file of the prefix, fenced like {@link deleteLtxFiles}. */

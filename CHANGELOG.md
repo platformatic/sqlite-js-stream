@@ -25,6 +25,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `FileReplicaClient.deletePrefix()`, `PgReplicaClient.deletePrefix()` and
+  `S3ReplicaClient.deletePrefix()` delete every replica under a prefix (the
+  replica at the prefix and those under `prefix/`), generation and lease records
+  included, and resolve with the prefixes of the deleted replicas. An optional
+  `generation` fences the deletion (atomically with PostgreSQL, best effort with
+  S3). The PostgreSQL deletion runs in one transaction, or in a savepoint of a
+  transaction passed as `sql`. New exported types: `FileDeletePrefixOptions`,
+  `PgDeletePrefixOptions`, `S3DeletePrefixOptions`.
 - `Replica.checkpoint(conn, mode = 'TRUNCATE')` syncs, checkpoints the WAL through the
   application's writing connection (`RESTART` or `TRUNCATE`), and records that the next WAL
   continues from the synced position, so the next `sync()` writes an incremental LTX file instead

@@ -49,6 +49,7 @@ import {
 } from '@aws-sdk/client-s3';
 
 import {
+  DefaultLeasePath,
   ErrGenerationSuperseded,
   HeaderSize,
   LTXError,
@@ -102,6 +103,34 @@ export interface S3ReplicaClientOptions {
   generation?: bigint | null;
 }
 
+/** Configuration for {@link S3ReplicaClient.deletePrefix}. */
+export interface S3DeletePrefixOptions {
+  /** S3 bucket name. Required. */
+  bucket: string;
+  /**
+   * Prefix to delete: the replica at this prefix and every replica under
+   * `prefix/` (`a` covers `a` and `a/b`, not `ab`). Leading/trailing slashes
+   * are normalized away. Must not be empty.
+   */
+  prefix: string;
+  /** AWS region. Defaults to the AWS SDK region resolution chain. */
+  region?: string;
+  /** Custom endpoint URL (e.g. for MinIO / LocalStack). */
+  endpoint?: string;
+  accessKeyId?: string;
+  secretAccessKey?: string;
+  sessionToken?: string;
+  /** Inject a preconfigured client. */
+  client?: S3ClientLike;
+  /**
+   * Fences the deletion: it fails with {@link ErrGenerationSuperseded} if a
+   * replica under the prefix has a higher generation, checked before deleting
+   * any of its objects (best effort, see {@link S3ReplicaClient.deletePrefix}).
+   * `null` (the default) deletes unconditionally.
+   */
+  generation?: bigint | null;
+}
+
 /** Name of the generation object, relative to the replica prefix. */
 export const GenerationObjectName = 'generation.json';
 
@@ -134,6 +163,42 @@ export function isFenced(fences: readonly GenerationFence[], generation: bigint,
     if (f.generation > generation && maxTXID > f.txid) return false;
   }
   return true;
+}
+
+/** Matches the key of an LTX file, capturing the prefix of its replica. */
+const LTX_KEY_RE = /^(.+)\/ltx\/\d+\/[^/]+$/;
+
+/** Returns the prefix of the replica a key belongs to, or null if none. */
+function replicaOfKey(key: string): string | null {
+  for (const name of [GenerationObjectName, DefaultLeasePath]) {
+    if (key.endsWith(`/${name}`)) return key.slice(0, -(name.length + 1));
+  }
+  return LTX_KEY_RE.exec(key)?.[1] ?? null;
+}
+
+/** Builds an S3 client from connection options, unless one is injected. */
+function createClient(opts: {
+  client?: S3ClientLike;
+  region?: string;
+  endpoint?: string;
+  accessKeyId?: string;
+  secretAccessKey?: string;
+  sessionToken?: string;
+}): S3ClientLike {
+  return (
+    opts.client ??
+    new S3Client({
+      region: opts.region,
+      endpoint: opts.endpoint,
+      credentials: opts.accessKeyId
+        ? {
+            accessKeyId: opts.accessKeyId,
+            secretAccessKey: opts.secretAccessKey ?? '',
+            sessionToken: opts.sessionToken,
+          }
+        : undefined,
+    })
+  );
 }
 
 /** Retries of a conditional write that keeps conflicting with concurrent ones. */
@@ -234,19 +299,7 @@ export class S3ReplicaClient implements ReplicaClient {
     this.bucket = opts.bucket;
     this.prefix = normalizePrefix(opts.prefix ?? '');
     this.generation = opts.generation ?? null;
-    this.client =
-      opts.client ??
-      new S3Client({
-        region: opts.region,
-        endpoint: opts.endpoint,
-        credentials: opts.accessKeyId
-          ? {
-              accessKeyId: opts.accessKeyId,
-              secretAccessKey: opts.secretAccessKey ?? '',
-              sessionToken: opts.sessionToken,
-            }
-          : undefined,
-      });
+    this.client = createClient(opts);
   }
 
   type(): string {
@@ -774,6 +827,118 @@ export class S3ReplicaClient implements ReplicaClient {
         }),
       );
     }
+  }
+
+  /**
+   * Deletes every replica under a prefix: every object whose key starts with
+   * `prefix/`, which covers the replica at `prefix` and every replica under
+   * it, generation objects (`generation.json`) and lease objects included
+   * (unlike {@link deleteAll}, which keeps the generation). Resolves with the
+   * sorted prefixes of the deleted replicas: those with an LTX file, a
+   * generation object or a lease object.
+   *
+   * The generation objects are deleted last, so former writers stay fenced
+   * while the files are deleted. Once they are gone, nothing fences those
+   * writers anymore: a writer that is still running can upload again and
+   * create the replica anew. Stop the writers first.
+   *
+   * With {@link S3DeletePrefixOptions.generation}, the deletion is fenced as
+   * the deletions of a fenced client are, on a best-effort basis: the
+   * generation object of each replica is read before deleting its first
+   * object, and again before deleting the generation objects, and the
+   * deletion fails with {@link ErrGenerationSuperseded} if it holds a higher
+   * generation. S3 cannot check one object and delete another atomically, so
+   * a generation registered between a check and a `DeleteObjects` request
+   * does not stop it, and the replicas already processed stay deleted.
+   */
+  static async deletePrefix(opts: S3DeletePrefixOptions): Promise<string[]> {
+    if (!opts.bucket) {
+      throw new Error('S3 replica client: bucket is required');
+    }
+    const prefix = normalizePrefix(opts.prefix ?? '');
+    if (prefix === '') {
+      throw new Error('S3 replica client: deletePrefix requires a non-empty prefix');
+    }
+    const bucket = opts.bucket;
+    const generation = opts.generation ?? null;
+    const ownClient = opts.client === undefined;
+    const client = createClient(opts);
+
+    const replicas = new Set<string>();
+    const checked = new Set<string>();
+    const generationKeys: string[] = [];
+    let pending: Array<{ Key: string }> = [];
+
+    const assertReplica = async (replica: string): Promise<void> => {
+      if (generation === null) return;
+      let res;
+      try {
+        res = await client.send(
+          new GetObjectCommand({ Bucket: bucket, Key: `${replica}/${GenerationObjectName}` }),
+        );
+      } catch (err) {
+        if (isNotFound(err)) return;
+        throw err;
+      }
+      const stored = decodeGenerationState(await readBody(res.Body)).generation;
+      if (stored > generation) throw new ErrGenerationSuperseded(stored);
+    };
+
+    const flush = async (objects: Array<{ Key: string }>): Promise<void> => {
+      for (let i = 0; i < objects.length; i += 1000) {
+        const res = await client.send(
+          new DeleteObjectsCommand({
+            Bucket: bucket,
+            Delete: { Objects: objects.slice(i, i + 1000), Quiet: true },
+          }),
+        );
+        const failed = (res?.Errors ?? []) as Array<{ Key?: string; Code?: string; Message?: string }>;
+        if (failed.length > 0) {
+          const e = failed[0];
+          throw new Error(`S3 replica client: failed to delete ${e.Key}: ${e.Code ?? ''} ${e.Message ?? ''}`.trim());
+        }
+      }
+    };
+
+    try {
+      let token: string | undefined;
+      do {
+        const res = await client.send(
+          new ListObjectsV2Command({ Bucket: bucket, Prefix: `${prefix}/`, ContinuationToken: token }),
+        );
+        for (const obj of (res.Contents ?? []) as Array<{ Key?: string }>) {
+          const key = obj.Key;
+          if (!key) continue;
+          const replica = replicaOfKey(key);
+          if (replica !== null) {
+            replicas.add(replica);
+            if (!checked.has(replica)) {
+              await assertReplica(replica);
+              checked.add(replica);
+            }
+          }
+          if (key.endsWith(`/${GenerationObjectName}`)) {
+            generationKeys.push(key);
+            continue;
+          }
+          pending.push({ Key: key });
+          if (pending.length >= 1000) {
+            await flush(pending);
+            pending = [];
+          }
+        }
+        token = res.IsTruncated ? (res.NextContinuationToken ?? undefined) : undefined;
+      } while (token);
+      await flush(pending);
+
+      for (const key of generationKeys) {
+        await assertReplica(key.slice(0, -(GenerationObjectName.length + 1)));
+      }
+      await flush(generationKeys.map((Key) => ({ Key })));
+    } finally {
+      if (ownClient) (client as S3Client).destroy();
+    }
+    return [...replicas].sort();
   }
 
   /**
