@@ -1,13 +1,17 @@
 name: Publish release
 
-# Manually triggered release. Tests are not run here: they run in CI on every
-# push to main. Bumps every workspace package to the same version, pushes the
-# bump commit, publishes to npm via OIDC trusted publishing (no NPM_TOKEN) and
-# creates the GitHub release.
+# Manually triggered release. The test suites are not run here: they run in CI
+# on every push to main. Only the builds of the native library of the paged VFS
+# are tested, as they are made here, one per platform. Then the workflow bumps
+# every workspace package to the same version, pushes the bump commit,
+# publishes to npm via OIDC trusted publishing (no NPM_TOKEN) and creates the
+# GitHub release.
 #
 # Publishing is only possible from the `main` environment, which is
 # restricted to the `main` branch; the npm trusted publisher configuration
-# for each package must reference this workflow and that environment.
+# for each package must reference this workflow and that environment. That
+# includes the platform packages of the paged VFS, such as
+# @platformatic/sqlite-js-stream-paged-vfs-linux-x64-gnu.
 on:
   workflow_dispatch:
     inputs:
@@ -22,7 +26,12 @@ on:
         default: false
 
 jobs:
+  paged-vfs-binaries:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    uses: ./.github/workflows/paged-vfs-binaries.yml
+
   release-npm:
+    needs: paged-vfs-binaries
     if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 15
@@ -64,6 +73,39 @@ jobs:
 
       - name: Push changes
         run: git push origin HEAD:${{ github.ref }}
+
+      - name: Download paged-vfs binaries
+        uses: actions/download-artifact@v5
+        with:
+          pattern: paged-vfs-*
+          path: packages/sqlite-js-stream-paged-vfs/artifacts
+          merge-multiple: true
+
+      # One package per platform, under npm/, with the bumped version. The main
+      # package gets them as optionalDependencies, in this checkout only.
+      - name: Prepare paged-vfs platform packages
+        working-directory: packages/sqlite-js-stream-paged-vfs
+        run: |
+          pnpm exec napi create-npm-dirs
+          pnpm exec napi artifacts
+          pnpm exec napi pre-publish --tag-style npm --skip-optional-publish
+
+      # Before the main package, which depends on them. Versions already on npm
+      # are skipped, so that a failed release can run again.
+      - name: Publish paged-vfs platform packages to npm (OIDC + provenance)
+        working-directory: packages/sqlite-js-stream-paged-vfs
+        env:
+          NPM_TAG: ${{ inputs.prerelease == true && 'next' || 'latest' }}
+        run: |
+          for dir in npm/*/; do
+            name=$(node -p "require('./${dir}package.json').name")
+            version=$(node -p "require('./${dir}package.json').version")
+            if npm view "$name@$version" version > /dev/null 2>&1; then
+              echo "$name@$version is already published"
+            else
+              npm publish "$dir" --access public --tag "$NPM_TAG" --provenance
+            fi
+          done
 
       - name: Publish packages to npm (OIDC + provenance)
         run: pnpm -r publish --access public --tag ${{ inputs.prerelease == true && 'next' || 'latest' }} --provenance --publish-branch ${{ github.ref_name }} --no-git-checks

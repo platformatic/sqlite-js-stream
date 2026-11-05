@@ -25,6 +25,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `@platformatic/sqlite-js-stream-paged-vfs`, a new package: a SQLite VFS for
+  `node:sqlite` that restores a database page by page on demand. Queries run
+  while the database downloads; a read of a missing page waits until the
+  application fills it. Experimental. Prebuilt for macOS arm64/x64 and Linux
+  x64/arm64 (glibc 2.17+ or musl), one optional dependency per platform.
 - `FileReplicaClient.deletePrefix()`, `PgReplicaClient.deletePrefix()` and
   `S3ReplicaClient.deletePrefix()` delete every replica under a prefix (the
   replica at the prefix and those under `prefix/`), generation and lease records

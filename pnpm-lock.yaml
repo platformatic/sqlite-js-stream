@@ -215,7 +215,7 @@ importers:
         specifier: ^5.7.0
         version: 5.9.3
 
-  packages/paged-vfs:
+  packages/sqlite-js-stream-paged-vfs:
     devDependencies:
       '@napi-rs/cli':
         specifier: ^3.10.12

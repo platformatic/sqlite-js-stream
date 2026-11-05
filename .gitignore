@@ -1,9 +1,12 @@
 # Dependencies
 node_modules/
 
-# Rust build output and native addons (packages/paged-vfs)
+# Rust build output and native addons (packages/sqlite-js-stream-paged-vfs),
+# and the platform packages the release workflow creates from them
 target/
 *.node
+packages/sqlite-js-stream-paged-vfs/artifacts/
+packages/sqlite-js-stream-paged-vfs/npm/
 
 # Build / output
 dist/

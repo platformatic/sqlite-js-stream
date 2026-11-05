@@ -24,7 +24,7 @@ export interface ReadResult {
 }
 
 export function tempDir(t: TestContext): string {
-  const dir = mkdtempSync(join(tmpdir(), 'paged-vfs-'));
+  const dir = mkdtempSync(join(tmpdir(), 'sqlite-js-stream-paged-vfs-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   return dir;
 }

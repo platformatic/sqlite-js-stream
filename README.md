@@ -44,6 +44,16 @@ pnpm add @platformatic/sqlite-js-stream-pg   # optional addon
 Importing the addon registers the `s3` URL scheme with
 `newReplicaClientFromURL('s3://bucket/prefix')`.
 
+**`@platformatic/sqlite-js-stream-paged-vfs`** is a SQLite VFS for `node:sqlite`
+which reads the pages of a database on demand, so that an application can query
+a large database while it is still being restored. It is a native library, with
+prebuilt binaries for macOS and Linux. See its
+[README](packages/sqlite-js-stream-paged-vfs/README.md).
+
+```bash
+pnpm add @platformatic/sqlite-js-stream-paged-vfs
+```
+
 ---
 
 ## Quick start

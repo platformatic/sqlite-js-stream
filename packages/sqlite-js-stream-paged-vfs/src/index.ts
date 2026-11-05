@@ -58,7 +58,7 @@ interface Binding {
 }
 
 /** The name of the VFS, for the `vfs` parameter of a SQLite URI. */
-export const VFS_NAME = 'sqlite-js-stream-paged';
+export const VFS_NAME = 'sqlite-js-stream-paged-vfs';
 
 const require = createRequire(import.meta.url);
 let loaded: Binding | null = null;
@@ -79,9 +79,10 @@ function platform(): string {
  * of the package for this platform.
  */
 export function libraryPath(): string {
-  const name = `paged-vfs.${platform()}.node`;
+  const name = `sqlite-js-stream-paged-vfs.${platform()}.node`;
+  const platformPackage = `@platformatic/sqlite-js-stream-paged-vfs-${platform()}`;
 
-  for (const candidate of [join(import.meta.dirname, '..', name), `@platformatic/sqlite-js-stream-paged-vfs-${platform()}/${name}`]) {
+  for (const candidate of [join(import.meta.dirname, '..', name), `${platformPackage}/${name}`]) {
     try {
       return realpathSync(require.resolve(candidate));
     } catch {
@@ -89,7 +90,11 @@ export function libraryPath(): string {
     }
   }
 
-  throw new Error(`The paged VFS is not available for ${platform()}: "${name}" was not found.`);
+  throw new Error(
+    `The paged VFS is not available for ${platform()}: neither "${name}" nor ${platformPackage} were found. ` +
+      `${platformPackage} is an optional dependency: it is missing when optional dependencies are omitted, ` +
+      'and it does not exist for an unsupported platform.',
+  );
 }
 
 function binding(): Binding {

@@ -10,7 +10,7 @@ use libsqlite3_sys as ffi;
 
 use crate::paged::{self, PagedDb};
 
-pub const NAME: &CStr = c"sqlite-js-stream-paged";
+pub const NAME: &CStr = c"sqlite-js-stream-paged-vfs";
 
 type CreateFilename =
     unsafe extern "C" fn(*const c_char, *const c_char, *const c_char, c_int, *mut *const c_char) -> *const c_char;

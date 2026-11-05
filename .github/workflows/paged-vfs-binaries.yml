@@ -1,0 +1,147 @@
+name: paged-vfs binaries
+
+# Builds the native library of @platformatic/sqlite-js-stream-paged-vfs for
+# every platform it is published for, then tests each build on its platform.
+# Each build is uploaded as the artifact paged-vfs-<target>, which the release
+# workflow publishes. CI runs this workflow too, so that a release never finds
+# a broken build.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  PACKAGE_DIR: packages/sqlite-js-stream-paged-vfs
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.host }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            host: macos-latest
+          - target: x86_64-apple-darwin
+            host: macos-latest
+          # The napi-rs cross toolchain links against glibc 2.17, so that the
+          # library loads on every distribution Node.js supports.
+          - target: x86_64-unknown-linux-gnu
+            host: ubuntu-26.04
+            flags: --use-napi-cross
+          - target: aarch64-unknown-linux-gnu
+            host: ubuntu-26.04
+            flags: --use-napi-cross
+          # cargo-zigbuild, which needs zig.
+          - target: x86_64-unknown-linux-musl
+            host: ubuntu-26.04
+            flags: --cross-compile
+          - target: aarch64-unknown-linux-musl
+            host: ubuntu-26.04
+            flags: --cross-compile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup zig
+        if: contains(matrix.target, 'musl')
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Install cargo-zigbuild
+        if: contains(matrix.target, 'musl')
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.PACKAGE_DIR }}
+          key: ${{ matrix.target }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        working-directory: ${{ env.PACKAGE_DIR }}
+        run: pnpm build:native --target ${{ matrix.target }} ${{ matrix.flags }}
+
+      - name: Upload
+        uses: actions/upload-artifact@v5
+        with:
+          name: paged-vfs-${{ matrix.target }}
+          path: ${{ env.PACKAGE_DIR }}/*.node
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.target }})
+    needs: build
+    runs-on: ${{ matrix.host }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            host: macos-latest
+          # Under Rosetta 2, with an x64 build of Node.js
+          - target: x86_64-apple-darwin
+            host: macos-latest
+            architecture: x64
+          - target: x86_64-unknown-linux-gnu
+            host: ubuntu-26.04
+          - target: aarch64-unknown-linux-gnu
+            host: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-musl
+            host: ubuntu-26.04
+            image: node:24-alpine
+          - target: aarch64-unknown-linux-musl
+            host: ubuntu-24.04-arm
+            image: node:24-alpine
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download the build
+        uses: actions/download-artifact@v5
+        with:
+          name: paged-vfs-${{ matrix.target }}
+          path: ${{ env.PACKAGE_DIR }}
+
+      - name: Setup Node
+        if: ${{ !matrix.image }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          architecture: ${{ matrix.architecture }}
+
+      # The tests have no dependencies, so they run without installing any
+      - name: Test
+        if: ${{ !matrix.image }}
+        working-directory: ${{ env.PACKAGE_DIR }}
+        run: node --test 'test/**/*.test.ts'
+
+      - name: Test in ${{ matrix.image }}
+        if: ${{ matrix.image }}
+        run: >-
+          docker run --rm -v "$PWD:/repo" -w "/repo/$PACKAGE_DIR" ${{ matrix.image }}
+          node --test 'test/**/*.test.ts'

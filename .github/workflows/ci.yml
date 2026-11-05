@@ -97,17 +97,20 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: packages/paged-vfs
+          workspaces: packages/sqlite-js-stream-paged-vfs
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Check Rust formatting and lints
-        working-directory: packages/paged-vfs
+        working-directory: packages/sqlite-js-stream-paged-vfs
         run: cargo fmt --check && cargo clippy --release -- -D warnings
 
       - name: Build and test
         run: pnpm test:paged-vfs
+
+  paged-vfs-binaries:
+    uses: ./.github/workflows/paged-vfs-binaries.yml
 
   interop-go:
     name: go-interop goldens (regenerate + verify)
