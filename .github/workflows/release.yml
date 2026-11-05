@@ -83,12 +83,14 @@ jobs:
 
       # One package per platform, under npm/, with the bumped version. The main
       # package gets them as optionalDependencies, in this checkout only.
+      # pre-publish neither publishes (the next step does) nor creates a GitHub
+      # release (the last steps do).
       - name: Prepare paged-vfs platform packages
         working-directory: packages/sqlite-js-stream-paged-vfs
         run: |
           pnpm exec napi create-npm-dirs
           pnpm exec napi artifacts
-          pnpm exec napi pre-publish --tag-style npm --skip-optional-publish
+          pnpm exec napi pre-publish --tag-style npm --skip-optional-publish --no-gh-release
 
       # Before the main package, which depends on them. Versions already on npm
       # are skipped, so that a failed release can run again.
