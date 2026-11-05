@@ -1,0 +1,62 @@
+{
+  "name": "@platformatic/sqlite-js-stream-paged-vfs",
+  "version": "0.3.0",
+  "private": true,
+  "description": "SQLite VFS that reads the pages of a database on demand, for @platformatic/sqlite-js-stream",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "license": "Apache-2.0",
+  "author": "Matteo Collina",
+  "homepage": "https://github.com/platformatic/sqlite-js-stream/tree/main/packages/paged-vfs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/platformatic/sqlite-js-stream.git",
+    "directory": "packages/paged-vfs"
+  },
+  "bugs": {
+    "url": "https://github.com/platformatic/sqlite-js-stream/issues"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "napi": {
+    "binaryName": "paged-vfs",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-musl"
+    ]
+  },
+  "scripts": {
+    "build:native": "napi build --platform --release --no-js --dts target/paged-vfs.d.ts",
+    "build:native:debug": "napi build --platform --no-js --dts target/paged-vfs.d.ts",
+    "test": "node --test 'test/**/*.test.ts'",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "pnpm build"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.10.12",
+    "@types/node": "^26.0.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,6 +1,10 @@
 # Dependencies
 node_modules/
 
+# Rust build output and native addons (packages/paged-vfs)
+target/
+*.node
+
 # Build / output
 dist/
 coverage/

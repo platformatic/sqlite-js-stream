@@ -1,0 +1,7 @@
+[env]
+# libsqlite3-sys probes pkg-config even for a loadable extension, which would link the library to a system SQLite
+SQLITE3_NO_PKG_CONFIG = "1"
+
+# A cdylib cannot be linked statically against musl
+[target.'cfg(target_env = "musl")']
+rustflags = ["-C", "target-feature=-crt-static"]

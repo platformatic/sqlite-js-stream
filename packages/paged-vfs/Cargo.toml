@@ -1,0 +1,25 @@
+[package]
+name = "sqlite-js-stream-paged-vfs"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "native/lib.rs"
+
+[dependencies]
+# Only the type definitions are used: the functions of SQLite are read from the API table that node:sqlite passes to
+# sqlite3_extension_init(), so that the VFS is registered in the SQLite linked into Node.js. Never enable "bundled".
+# .cargo/config.toml disables pkg-config, so that the library is not linked to a system SQLite either.
+libsqlite3-sys = { version = "0.39", features = ["loadable_extension"] }
+napi = { version = "3", default-features = false, features = ["napi4"] }
+napi-derive = "3"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
