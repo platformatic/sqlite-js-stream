@@ -10,6 +10,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 - `S3ReplicaClient.openLtxFile()` reads a range with a single `GetObject`, without
   the `HeadObject` it sent first, which halves the requests of a paged restore.
+- `PgReplicaClient.openLtxFile()` reads a range in one query instead of two (the
+  file row, then its chunks), and Postgres returns only the bytes of the range
+  instead of every 1 MiB chunk it covers. A read of 128 KiB, the size of a paged
+  restore's read for a page, went from 9.7 ms to 1.4 ms against a local server.
 - The first `sync()` after a restore into the replica's own path (as `ensureExists()` does) uploads
   only the changes made since the restore, instead of a snapshot of the whole database. The restore
   writes the first WAL of the restored database: one commit frame holding page 1 unchanged, under

@@ -136,7 +136,8 @@ function txid(v: bigint): string {
 
 /** Shape of a row from `ltx_chunks`. */
 interface ChunkRow {
-  seq: number;
+  /** Null when the file has no chunk in the range read. */
+  seq: number | null;
   data: Uint8Array;
 }
 
@@ -346,65 +347,73 @@ export class PgReplicaClient implements ReplicaClient {
     const { level, minTXID, maxTXID, offset, size } = opts;
     const path = this.filePathKey(level, minTXID, maxTXID);
 
-    let fileRow;
-    try {
-      fileRow = await this.sql`
-        SELECT size FROM ${this.sql(this.filesTable())}
-        WHERE prefix = ${this.prefix} AND level = ${level}
-          AND min_txid = ${txid(minTXID)} AND max_txid = ${txid(maxTXID)}
-      `;
-    } catch (err) {
-      throw new LTXError('open', path, level, minTXID, maxTXID, err);
-    }
-    if (fileRow.length === 0) {
-      throw new LTXError('open', path, level, minTXID, maxTXID, new Error('not found'));
-    }
-
-    const fileSize = Number(fileRow[0].size);
-    if (offset >= fileSize) return Readable.from([]);
-    const end = size > 0 ? Math.min(offset + size - 1, fileSize - 1) : fileSize - 1;
-    if (end < offset) return Readable.from([]);
-
-    const firstSeq = Math.floor(offset / this.chunkSize);
-    const lastSeq = Math.floor(end / this.chunkSize);
+    // One query, so one round trip for a range of up to 16 chunks: the file
+    // row, joined with the chunks the range covers, each cut to the bytes of
+    // the range by the server. No row means no file; a row without a chunk, a
+    // range past the end of the file. Chunks are stored uncompressed (LTX
+    // pages already are), so Postgres reads only the part of a chunk asked
+    // for. Offsets are bigints: files can be larger than 2 GiB.
+    const chunkSize = this.chunkSize;
+    const firstSeq = Math.floor(offset / chunkSize);
+    const start = String(offset);
+    const chunkStart = this.sql`c.seq::bigint * ${chunkSize}::bigint`;
+    const from = this.sql`(greatest(${start}::bigint - ${chunkStart}, 0) + 1)::int`;
+    const lastSeq = size > 0 ? Math.floor((offset + size - 1) / chunkSize) : null;
+    const data =
+      size > 0
+        ? this.sql`substring(c.data FROM ${from} FOR least(${String(offset + size)}::bigint - greatest(${start}::bigint, ${chunkStart}), ${chunkSize}::bigint)::int)`
+        : this.sql`substring(c.data FROM ${from})`;
 
     // Stream the chunk rows back lazily via a server-side cursor so a large
     // snapshot is never buffered whole in memory (matching the file/S3
     // backends). Breaking out of the stream early closes the portal and
     // releases the connection.
-    let cursor: AsyncIterable<ChunkRow[]>;
+    let batches: AsyncIterator<ChunkRow[]>;
+    let first: IteratorResult<ChunkRow[]>;
     try {
-      cursor = this.sql`
-        SELECT seq, data FROM ${this.sql(this.chunksTable())}
-        WHERE prefix = ${this.prefix} AND level = ${level}
-          AND min_txid = ${txid(minTXID)} AND max_txid = ${txid(maxTXID)}
-          AND seq BETWEEN ${firstSeq} AND ${lastSeq}
-        ORDER BY seq ASC
+      const cursor = this.sql`
+        SELECT c.seq, ${data} AS data
+        FROM ${this.sql(this.filesTable())} f
+        LEFT JOIN ${this.sql(this.chunksTable())} c
+          ON c.prefix = f.prefix AND c.level = f.level
+          AND c.min_txid = f.min_txid AND c.max_txid = f.max_txid
+          AND c.seq >= ${firstSeq}
+          ${lastSeq === null ? this.sql`` : this.sql`AND c.seq <= ${lastSeq}`}
+        WHERE f.prefix = ${this.prefix} AND f.level = ${level}
+          AND f.min_txid = ${txid(minTXID)} AND f.max_txid = ${txid(maxTXID)}
+        ORDER BY c.seq ASC
       `.cursor(16) as unknown as AsyncIterable<ChunkRow[]>;
+      batches = cursor[Symbol.asyncIterator]();
+      // The first batch tells whether the file exists
+      first = await batches.next();
     } catch (err) {
       throw new LTXError('open', path, level, minTXID, maxTXID, err);
     }
+    if (first.done || first.value.length === 0) {
+      throw new LTXError('open', path, level, minTXID, maxTXID, new Error('not found'));
+    }
+    if (first.value[0].seq === null) return Readable.from([]);
 
-    return Readable.from(this.iterateChunkCursor(cursor, offset, end));
+    return Readable.from(this.iterateChunkCursor(first.value, batches));
   }
 
-  /** Streams the requested byte range from a chunk-row cursor. */
+  /** Streams the chunk parts of the first batch of rows, then of the next ones. */
   private async *iterateChunkCursor(
-    cursor: AsyncIterable<ChunkRow[]>,
-    offset: number,
-    end: number,
+    first: ChunkRow[],
+    batches: AsyncIterator<ChunkRow[]>,
   ): AsyncIterable<Uint8Array> {
-    for await (const rows of cursor) {
-      for (const row of rows) {
-        const data = row.data;
-        const chunkStart = Number(row.seq) * this.chunkSize;
-        const chunkEnd = chunkStart + data.length - 1;
-        if (chunkEnd < offset) continue;
-        if (chunkStart > end) return;
-        const s = Math.max(offset, chunkStart) - chunkStart;
-        const e = Math.min(end, chunkEnd) - chunkStart;
-        yield data.subarray(s, e + 1);
+    try {
+      for (let rows = first; ; ) {
+        for (const row of rows) {
+          if (row.data.length > 0) yield row.data;
+        }
+        const next = await batches.next();
+        if (next.done) return;
+        rows = next.value;
       }
+    } finally {
+      // Closes the portal when the stream is destroyed early
+      await batches.return?.();
     }
   }
 

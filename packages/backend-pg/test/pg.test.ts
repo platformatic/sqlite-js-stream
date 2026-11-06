@@ -18,7 +18,8 @@ import {
   PgReplicaClient,
   type PgReplicaClientOptions,
 } from '../src/index.ts';
-import { connectForTest } from './helpers/db.ts';
+import postgres from 'postgres';
+import { connectForTest, pgUrl } from './helpers/db.ts';
 import { createWALDB } from './helpers/wal-db.ts';
 
 function concatBytes(chunks: readonly Uint8Array[]): Uint8Array {
@@ -209,6 +210,46 @@ test('openLtxFile reads a full file and byte ranges', async (t) => {
     }),
   );
   assert.deepEqual([...tail], [...body.subarray(body.length - 10)]);
+});
+
+test('openLtxFile reads ranges across chunks, in one query each', async (t) => {
+  const queries: string[] = [];
+  const sql = postgres(pgUrl(), { onnotice: () => {}, max: 1, debug: (_connection, query) => queries.push(query) });
+  t.after(() => sql.end({ timeout: 1 }));
+  // 40 chunks of 64 bytes: more than a batch of the cursor (16 rows)
+  const client = new PgReplicaClient({ sql, createTables: true, prefix: makePrefix(), chunkSize: 64 });
+  const { body } = makeLtxBody(40 * 64 - 100);
+  await client.writeLtxFile({ level: 0, minTXID: 1n, maxTXID: 1n }, iter(body));
+
+  const read = async (offset: number, size: number): Promise<number[]> => {
+    queries.length = 0;
+    const bytes = await collect(await client.openLtxFile({ level: 0, minTXID: 1n, maxTXID: 1n, offset, size }));
+    // One query: the next batches of a long range continue it
+    assert.equal(queries.length, 1, `queries for ${offset}+${size}: ${queries.length}`);
+    return [...bytes];
+  };
+  const want = (offset: number, size: number): number[] => [...body.subarray(offset, size > 0 ? offset + size : undefined)];
+
+  for (const [offset, size] of [
+    [0, 0], // the whole file
+    [0, 64], // one chunk
+    [10, 20], // inside a chunk
+    [60, 10], // across two chunks
+    [64, 128], // from a chunk boundary
+    [100, 1000], // across many chunks
+    [130, 0], // to the end, from inside a chunk
+    [body.length - 5, 100], // past the end
+    [body.length, 10], // from the end
+    [body.length + 100, 0], // past the end, to the end
+  ]) {
+    assert.deepEqual(await read(offset, size), want(offset, size), `range ${offset}+${size}`);
+  }
+
+  // A stream left early releases the connection, the only one of the pool
+  const stream = await client.openLtxFile({ level: 0, minTXID: 1n, maxTXID: 1n, offset: 0, size: 0 });
+  await stream[Symbol.asyncIterator]().next();
+  stream.destroy();
+  assert.deepEqual(await read(10, 20), want(10, 20));
 });
 
 test('openLtxFile returns an empty stream when offset >= size', async (t) => {
