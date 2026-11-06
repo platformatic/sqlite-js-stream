@@ -4,7 +4,7 @@ import { CreateBucketCommand, ListObjectsV2Command, PutObjectCommand, S3Client }
 
 import { marshalHeader } from '@platformatic/sqlite-js-stream';
 
-import { deletePrefixSuite, type DeletePrefixBackend } from '../../../test/helpers/delete-prefix-suite.ts';
+import { deletePrefixSuite, type DeletePrefixBackend } from '../../sqlite-js-stream/test/helpers/delete-prefix-suite.ts';
 
 import { S3Leaser, S3ReplicaClient, type S3ClientLike } from '../src/index.ts';
 import { MemoryS3 } from './helpers/memory-s3.ts';

@@ -68,7 +68,7 @@ jobs:
           VERSION_INPUT: ${{ inputs.version }}
         run: |
           node scripts/bump-version.mjs "$VERSION_INPUT" "$GITHUB_ACTOR"
-          version=$(node -p "require('./package.json').version")
+          version=$(node -p "require('./packages/sqlite-js-stream/package.json').version")
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
       - name: Push changes

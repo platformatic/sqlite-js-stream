@@ -1,7 +1,8 @@
 {
-  "name": "@platformatic/sqlite-js-stream",
+  "name": "sqlite-js-stream",
   "version": "0.5.0",
-  "description": "Node.js port of Litestream: SQLite streaming replication & disaster recovery via LTX files",
+  "description": "Monorepo for @platformatic/sqlite-js-stream and its addons",
+  "private": true,
   "type": "module",
   "packageManager": "pnpm@12.16.1",
   "engines": {
@@ -17,56 +18,20 @@
   "bugs": {
     "url": "https://github.com/platformatic/sqlite-js-stream/issues"
   },
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "default": "./dist/index.js"
-    },
-    "./package.json": "./package.json"
-  },
-  "files": [
-    "dist",
-    "src",
-    "README.md",
-    "LICENSE",
-    "NOTICE",
-    "CHANGELOG.md"
-  ],
-  "publishConfig": {
-    "access": "public",
-    "registry": "https://registry.npmjs.org"
-  },
   "scripts": {
-    "test": "node --test 'test/**/*.test.ts'",
+    "build": "pnpm --filter @platformatic/sqlite-js-stream build",
     "pretypecheck": "pnpm build",
-    "typecheck": "tsc -p . --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck:all": "pnpm typecheck",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "build": "tsc -p tsconfig.build.json",
-    "prepack": "pnpm build",
-    "golden:go": "cd tools/golden && go run .",
     "pretest:all": "pnpm build",
-    "test:all": "pnpm test && pnpm -r --filter '!@platformatic/sqlite-js-stream-paged-vfs' test",
-    "test:paged-vfs": "pnpm --filter @platformatic/sqlite-js-stream-paged-vfs build:native && pnpm --filter @platformatic/sqlite-js-stream-paged-vfs build && pnpm --filter @platformatic/sqlite-js-stream-paged-vfs test && node --test test/integration/paged-restore.test.ts",
-    "typecheck:all": "pnpm typecheck",
-    "bench": "node bench/bench-sync-restore.ts"
-  },
-  "dependencies": {
-    "lz4js": "^0.2.0"
-  },
-  "peerDependencies": {
-    "@platformatic/sqlite-js-stream-paged-vfs": "workspace:^"
-  },
-  "peerDependenciesMeta": {
-    "@platformatic/sqlite-js-stream-paged-vfs": {
-      "optional": true
-    }
+    "test:all": "pnpm -r --filter '!@platformatic/sqlite-js-stream-paged-vfs' test",
+    "test:paged-vfs": "pnpm --filter @platformatic/sqlite-js-stream-paged-vfs build:native && pnpm --filter @platformatic/sqlite-js-stream-paged-vfs build && pnpm --filter @platformatic/sqlite-js-stream-paged-vfs test && node --test packages/sqlite-js-stream/test/integration/paged-restore.test.ts",
+    "bench": "pnpm --filter @platformatic/sqlite-js-stream bench",
+    "golden:go": "cd packages/sqlite-js-stream/tools/golden && go run ."
   },
   "devDependencies": {
-    "@platformatic/sqlite-js-stream-paged-vfs": "workspace:*",
     "@types/node": "^26.0.0",
     "eslint": "^9.39.5",
     "neostandard": "^0.14.0",
@@ -78,6 +43,7 @@
     "replication",
     "backup",
     "ltx",
-    "disaster-recovery"
+    "disaster-recovery",
+    "monorepo"
   ]
 }

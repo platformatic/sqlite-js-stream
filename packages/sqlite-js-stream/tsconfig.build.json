@@ -1,5 +1,5 @@
 {
-  "extends": "./tsconfig.json",
+  "extends": "../../tsconfig.json",
   "compilerOptions": {
     "noEmit": false,
     "declaration": true,
@@ -8,5 +8,5 @@
     "rootDir": "src"
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["test", "packages", "node_modules", "dist", "bench"]
+  "exclude": ["test", "bench", "tools", "testdata", "docs", "node_modules", "dist"]
 }

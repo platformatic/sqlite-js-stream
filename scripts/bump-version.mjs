@@ -4,8 +4,10 @@
  * Usage: node scripts/bump-version.mjs <version|patch|minor|major> [github-actor]
  *
  * The root package and every `packages/*` package are released in lockstep,
- * so they all receive the same version. `workspace:*` dependencies are
- * rewritten to the concrete version by `pnpm publish`.
+ * so they all receive the same version. The root package is private (not
+ * published); the base version is read from the core package and every
+ * `packages/*` package that ships a `package.json` is bumped. `workspace:*`
+ * dependencies are rewritten to the concrete version by `pnpm publish`.
  */
 import { execFileSync } from 'node:child_process'
 import { readdir, readFile, writeFile } from 'node:fs/promises'
@@ -47,7 +49,7 @@ async function getVersion () {
   if (!input) throw new Error('Missing version argument (version, patch, minor or major).')
 
   if (['major', 'minor', 'patch'].includes(input)) {
-    const { version } = await readJson('package.json')
+    const { version } = await readJson('packages/sqlite-js-stream/package.json')
     return inc(version, input)
   }
 
@@ -60,10 +62,17 @@ async function getVersion () {
 
 async function getPackageFiles () {
   const entries = await readdir('packages', { withFileTypes: true })
-  return [
-    'package.json',
-    ...entries.filter((e) => e.isDirectory()).map((e) => path.join('packages', e.name, 'package.json')),
-  ]
+  const files = []
+  for (const entry of entries.filter((e) => e.isDirectory())) {
+    const file = path.join('packages', entry.name, 'package.json')
+    try {
+      await readFile(file, 'utf8')
+      files.push(file)
+    } catch {
+      // Ignore directories without a package.json (e.g. leftover node_modules).
+    }
+  }
+  return files
 }
 
 const userInfo = getUserInfo()

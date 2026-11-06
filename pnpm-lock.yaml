@@ -165,14 +165,7 @@ settings:
 importers:
 
   .:
-    dependencies:
-      lz4js:
-        specifier: ^0.2.0
-        version: 0.2.0
     devDependencies:
-      '@platformatic/sqlite-js-stream-paged-vfs':
-        specifier: workspace:*
-        version: link:packages/sqlite-js-stream-paged-vfs
       '@types/node':
         specifier: ^26.0.0
         version: 26.6.6
@@ -190,7 +183,7 @@ importers:
     dependencies:
       '@platformatic/sqlite-js-stream':
         specifier: workspace:*
-        version: link:../..
+        version: link:../sqlite-js-stream
       postgres:
         specifier: ^4.0.0
         version: 4.0.0
@@ -209,8 +202,24 @@ importers:
         version: 3.1162.0
       '@platformatic/sqlite-js-stream':
         specifier: workspace:*
-        version: link:../..
+        version: link:../sqlite-js-stream
     devDependencies:
+      '@types/node':
+        specifier: ^26.0.0
+        version: 26.6.6
+      typescript:
+        specifier: ^5.7.0
+        version: 5.9.3
+
+  packages/sqlite-js-stream:
+    dependencies:
+      lz4js:
+        specifier: ^0.2.0
+        version: 0.2.0
+    devDependencies:
+      '@platformatic/sqlite-js-stream-paged-vfs':
+        specifier: workspace:*
+        version: link:../sqlite-js-stream-paged-vfs
       '@types/node':
         specifier: ^26.0.0
         version: 26.6.6

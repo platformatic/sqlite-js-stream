@@ -17,7 +17,7 @@ import {
   type Header,
 } from '@platformatic/sqlite-js-stream';
 
-import { fencingSuite } from '../../../test/helpers/fencing-suite.ts';
+import { fencingSuite } from '../../sqlite-js-stream/test/helpers/fencing-suite.ts';
 
 import { S3ReplicaClient, isFenced } from '../src/index.ts';
 import { MemoryS3 } from './helpers/memory-s3.ts';

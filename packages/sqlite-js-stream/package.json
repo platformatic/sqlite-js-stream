@@ -1,0 +1,73 @@
+{
+  "name": "@platformatic/sqlite-js-stream",
+  "version": "0.5.0",
+  "description": "Node.js port of Litestream: SQLite streaming replication & disaster recovery via LTX files",
+  "type": "module",
+  "packageManager": "pnpm@12.16.1",
+  "engines": {
+    "node": ">=24"
+  },
+  "license": "Apache-2.0",
+  "author": "Matteo Collina",
+  "homepage": "https://github.com/platformatic/sqlite-js-stream/tree/main/packages/sqlite-js-stream",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/platformatic/sqlite-js-stream.git",
+    "directory": "packages/sqlite-js-stream"
+  },
+  "bugs": {
+    "url": "https://github.com/platformatic/sqlite-js-stream/issues"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "scripts": {
+    "test": "node --test 'test/**/*.test.ts'",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "pnpm build",
+    "bench": "node bench/bench-sync-restore.ts"
+  },
+  "dependencies": {
+    "lz4js": "^0.2.0"
+  },
+  "peerDependencies": {
+    "@platformatic/sqlite-js-stream-paged-vfs": "workspace:^"
+  },
+  "peerDependenciesMeta": {
+    "@platformatic/sqlite-js-stream-paged-vfs": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@platformatic/sqlite-js-stream-paged-vfs": "workspace:*",
+    "@types/node": "^26.0.0",
+    "typescript": "^5.7.0"
+  },
+  "keywords": [
+    "sqlite",
+    "litestream",
+    "replication",
+    "backup",
+    "ltx",
+    "disaster-recovery"
+  ]
+}

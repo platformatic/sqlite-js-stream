@@ -56,7 +56,7 @@ function makeSourceDB(path: string, rows: number, batch: number): DatabaseSync {
 }
 
 /** Measures wall ms + peak RSS (sampled) around an async operation. */
-async function measure(fn: () => Promise<void>): Promise<{ ms: number; peakRssMB: number }> {
+async function measure(fn: () => Promise<unknown>): Promise<{ ms: number; peakRssMB: number }> {
   let peak = process.memoryUsage().rss;
   const sampler = setInterval(() => {
     const rss = process.memoryUsage().rss;

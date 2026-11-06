@@ -1,4 +1,4 @@
-import { fencingSuite } from '../../../test/helpers/fencing-suite.ts';
+import { fencingSuite } from '../../sqlite-js-stream/test/helpers/fencing-suite.ts';
 
 import { PgReplicaClient } from '../src/index.ts';
 import { connectForTest } from './helpers/db.ts';

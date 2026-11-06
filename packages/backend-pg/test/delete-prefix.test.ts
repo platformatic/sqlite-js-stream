@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 import { marshalHeader, type Header } from '@platformatic/sqlite-js-stream';
 
-import { deletePrefixSuite } from '../../../test/helpers/delete-prefix-suite.ts';
+import { deletePrefixSuite } from '../../sqlite-js-stream/test/helpers/delete-prefix-suite.ts';
 
 import { PgLeaser, PgReplicaClient } from '../src/index.ts';
 import { connectForTest, pgUrl } from './helpers/db.ts';
