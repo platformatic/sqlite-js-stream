@@ -7,6 +7,7 @@ import { once } from 'node:events';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 
 import {
   Decoder,
@@ -41,11 +42,11 @@ const Rows = 2000;
 const Tables = 80;
 
 /**
- * A database of about 2,000 pages, whose schema spans several pages and has
+ * A database of about `rows` pages, whose schema spans several pages and has
  * records larger than a page (so overflow pages), replicated as a level-9
  * snapshot followed by level-0 files which change some of its pages.
  */
-async function replicate(t: TestContext, client: ReplicaClient): Promise<DatabaseSync> {
+async function replicate(t: TestContext, client: ReplicaClient, rows = Rows): Promise<DatabaseSync> {
   const path = join(makeTempDir('paged-src-'), 'src.db');
   const src = new DatabaseSync(path);
   t.after(() => src.close());
@@ -56,7 +57,7 @@ async function replicate(t: TestContext, client: ReplicaClient): Promise<Databas
   for (let i = 0; i < Tables; i++) src.exec(`CREATE TABLE extra_${i} (a INTEGER, b TEXT, c BLOB, d REAL)`);
   const columns = Array.from({ length: 400 }, (_, i) => `column_with_a_long_name_${i} TEXT`).join(', ');
   src.exec(`CREATE TABLE wide (${columns})`);
-  src.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${Rows}) INSERT INTO t SELECT i, randomblob(3000) FROM n`);
+  src.exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${rows}) INSERT INTO t SELECT i, randomblob(3000) FROM n`);
   src.exec('COMMIT');
 
   const replica = new Replica(path, client);
@@ -78,28 +79,40 @@ async function replicate(t: TestContext, client: ReplicaClient): Promise<Databas
 /**
  * A client whose ranged reads of at least `minSize` bytes (those of the
  * background fill, not those for the pages queries wait for) wait for
- * `release()`.
+ * `release()`. It records the reads, and counts the bytes they return.
  */
-function gated(client: ReplicaClient, minSize = 256 * 1024): { client: ReplicaClient; release: () => void; reads: OpenLTXFileOptions[] } {
+function gated(
+  client: ReplicaClient,
+  minSize = 256 * 1024,
+): { client: ReplicaClient; release: () => void; reads: OpenLTXFileOptions[]; bytes: () => number } {
   let release!: () => void;
   const open = new Promise<void>((resolve) => {
     release = resolve;
   });
   const reads: OpenLTXFileOptions[] = [];
+  let bytes = 0;
   const proxy = new Proxy(client, {
     get(target, prop) {
       if (prop === 'openLtxFile') {
         return async (opts: OpenLTXFileOptions) => {
           reads.push(opts);
           if (opts.size >= minSize) await open;
-          return target.openLtxFile(opts);
+          const stream = await target.openLtxFile(opts);
+          return Readable.from(
+            (async function* () {
+              for await (const chunk of stream) {
+                bytes += chunk.length;
+                yield chunk;
+              }
+            })(),
+          );
         };
       }
       const value = Reflect.get(target, prop, target);
       return typeof value === 'function' ? value.bind(target) : value;
     },
   });
-  return { client: proxy, release, reads };
+  return { client: proxy, release, reads, bytes: () => bytes };
 }
 
 interface SqlWorker {
@@ -249,6 +262,62 @@ test('replication goes on while a paged restore fills the database', { skip }, a
   const before = (src.prepare('SELECT count(*) AS n FROM t').get() as { n: number }).n;
   assert.deepEqual(plain(check.prepare('SELECT count(*) AS n FROM t').all()), [{ n: before + 1 }]);
   await db.close();
+});
+
+test('once every page is restored, nothing is read from the replica', { skip }, async (t) => {
+  const backing = new FileReplicaClient(makeTempDir('paged-repl-'));
+  const src = await replicate(t, backing);
+  const { client, release, reads } = gated(backing);
+  release();
+
+  const path = join(makeTempDir('paged-dst-'), 'db.db');
+  const replica = new Replica(path, client);
+  t.after(() => replica.close());
+  const result = await replica.restorePaged();
+  await result.filled;
+  reads.length = 0;
+
+  // Queries read every page, writes are replicated, and a snapshot reads the database again
+  const db = sqlWorker(t, path, true);
+  assert.deepEqual(await db.all('PRAGMA integrity_check'), [{ integrity_check: 'ok' }]);
+  assert.deepEqual(
+    await db.all('SELECT count(*) AS n, sum(length(v)) AS size FROM t'),
+    plain(src.prepare('SELECT count(*) AS n, sum(length(v)) AS size FROM t').all()),
+  );
+  await db.exec("INSERT INTO t (v) VALUES (x'02')");
+  assert.equal((await replica.sync())?.maxTXID, 7n);
+  assert.equal((await replica.snapshot())?.maxTXID, 7n);
+  await db.close();
+
+  assert.deepEqual(reads, []);
+});
+
+test('the reads before a paged restore resolves barely grow with the database (acceptance)', { skip }, async (t) => {
+  // What is read before the database can be opened: the headers of two files, the page indexes of the plan (a few
+  // bytes per page), and the schema with its read-ahead. Queries then read only the pages they need, so the time to
+  // the first response does not grow with the size of the database the way a full restore does.
+  const measure = async (rows: number): Promise<{ size: number; before: number; reads: number }> => {
+    const backing = new FileReplicaClient(makeTempDir('paged-repl-'));
+    await replicate(t, backing, rows);
+    const { client, release, bytes, reads } = gated(backing);
+    t.after(release);
+
+    const path = join(makeTempDir('paged-dst-'), 'db.db');
+    const replica = new Replica(path, client);
+    t.after(() => replica.close());
+    const result = await replica.restorePaged();
+    const before = { before: bytes(), reads: reads.length };
+    release();
+    await result.filled;
+    return { size: (await readFile(path)).length, ...before };
+  };
+
+  const small = await measure(2000);
+  const large = await measure(8000);
+  assert.ok(large.size > 3.5 * small.size, `the large database (${large.size} bytes) is 4 times the small one (${small.size})`);
+  assert.ok(large.before < 2 * small.before, `read before opening: ${large.before} bytes for ${large.size}, ${small.before} for ${small.size}`);
+  assert.ok(large.before < large.size / 50, `read before opening: ${large.before} bytes, under 2% of ${large.size}`);
+  t.diagnostic(`read before opening: ${small.before} of ${small.size} bytes, ${large.before} of ${large.size} bytes`);
 });
 
 test('closing the replica stops a paged restore, and the database is restored again', { skip }, async (t) => {
