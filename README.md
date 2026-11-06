@@ -135,11 +135,18 @@ await replica.ensureExists();
 Restoring a replica's own database (`outputPath` equal to its path, as
 `ensureExists()` does) makes it the writer from the restored position: the local
 LTX cache of any previous database at that path is discarded, and the next
-`sync()` uploads the following TXID, starting from a snapshot. Any `-wal` and
-`-shm` files left at the output path are removed before the restored database
-is moved into place. `sync()` throws `ErrReplicaAhead` (`ERR_REPLICA_AHEAD`)
-rather than skipping uploads when the replica already has a higher TXID than the
-local database.
+`sync()` uploads the following TXID. Any `-wal` and `-shm` files left at the
+output path are removed before the restored database is moved into place.
+`sync()` throws `ErrReplicaAhead` (`ERR_REPLICA_AHEAD`) rather than skipping
+uploads when the replica already has a higher TXID than the local database.
+
+The restore also writes the first WAL of the restored database, under salts it
+records, so that the next `sync()` uploads only the changes made since the
+restore instead of a snapshot of the whole database. That holds while the WAL is
+not reset: a checkpoint that restarts or truncates it, or the last connection
+closing (which deletes it), makes the next `sync()` fall back to a snapshot.
+With `wal_autocheckpoint` disabled and checkpoints run through
+`replica.checkpoint()` (see below), syncs stay incremental from the restore on.
 
 ### Manage many databases
 

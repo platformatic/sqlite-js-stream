@@ -55,7 +55,8 @@ prevents the WAL from being checkpointed past our position.
    `MaxTXID` among local level-0 LTX files.
 2. Read the current database commit size (`PRAGMA page_count`) and the WAL file.
 3. **First sync** (no local files): write a **full-snapshot base** LTX file with every committed
-   page (`MinTXID = MaxTXID = 1`).
+   page (`MinTXID = MaxTXID = 1`). After a restore into the replica's own path, the first sync
+   is incremental instead (see [The first sync after a restore](#the-first-sync-after-a-restore)).
 4. **Later syncs**: resume the WAL reader from the previous sync's `WALOffset + WALSize` and salts
    (`WALReader.withOffset`). Build a **page map** of committed pages since then and write an
    **incremental** LTX file (only the changed pages, plus any DB-growth pages). If the WAL has been
@@ -126,6 +127,34 @@ stops, releases the lease and rejects with it (see [Fenced writes](#fenced-write
    zeros). Each later file's pages are then **overlaid** at their page offsets, so a later version of
    a page wins.
 4. The output file is truncated to the last file's committed page count and atomically renamed.
+5. When the output is the replica's own database, the local LTX cache is discarded and the restored
+   TXID `T` becomes the local position (`<db>-litestream/base-txid`), so the next sync uploads
+   `T + 1`. See the next section for how that sync stays incremental.
+
+### The first sync after a restore
+
+Without help, the first sync after a restore has no previous file to resume from, and writes a
+snapshot of the whole database: the first write after moving a large database to a new host would
+take time proportional to its size. The restore avoids it by writing the first WAL of the restored
+database itself (`writeRestoredWAL`), for databases in WAL mode (header bytes 18 and 19 are 2):
+
+- a valid WAL header with random salts, then one commit frame holding page 1 as it is in the
+  restored file, with the database size as its commit size. The frame changes nothing;
+- the record `{ txid: T, salt1, salt2, walSize, commit }` in `<db>-litestream/restore`.
+
+SQLite recovers that WAL when the database is opened, and appends the next commits to it under the
+same salts. Any reset of the WAL changes them: a writer restarting a fully checkpointed WAL keeps
+salt-1 plus one and picks a new salt-2, a WAL started by another connection after a reset gets
+random salts, and a WAL deleted by the last connection closing is created again with random salts.
+So while the WAL header has the recorded salts, the frames after the first one are every change
+since `T`, even if a partial checkpoint copied some of them into the database file meanwhile.
+
+`prevSyncInfo()` returns the record as the previous sync (`WALOffset = WALHeaderSize`, `WALSize =`
+one frame) when the local position is the restored TXID and no local file reaches it, so the
+first sync resumes after that frame like any later sync, and falls back to a snapshot when the
+salts differ. `checkpointToken()` sees the same position, so `Replica.checkpoint()` works right
+after a restore too. The record is used only when its `txid` is the restored one: a record left
+by an earlier restore is ignored.
 
 Because restore never materializes the full merged LTX (or the whole DB) in memory, peak memory is
 bounded by one page buffer plus the (small) page index, regardless of the database size.

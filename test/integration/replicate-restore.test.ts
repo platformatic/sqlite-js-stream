@@ -137,12 +137,11 @@ test('writes made after restoring a database on another host are replicated', as
 
   conn.exec("INSERT INTO t (name) VALUES ('d')");
 
-  // The first sync after the restore continues the sequence, from a snapshot.
+  // The first sync after the restore continues the sequence.
   const info = await second.sync();
   assert.equal(info?.minTXID, 3n);
   assert.deepEqual(await second.syncStatus(), { localTXID: 3n, remoteTXID: 3n, inSync: true });
 
-  // Later syncs are incremental again.
   conn.exec("INSERT INTO t (name) VALUES ('e')");
   assert.equal((await second.sync())?.minTXID, 4n);
 

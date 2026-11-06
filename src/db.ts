@@ -11,8 +11,10 @@
  */
 
 import { DatabaseSync } from 'node:sqlite';
+import { randomBytes } from 'node:crypto';
 import { rmSync, writeFileSync } from 'node:fs';
-import { open, readFile, readdir, rename, rm, stat, type FileHandle } from 'node:fs/promises';
+import { open, readFile, readdir, rename, rm, stat, writeFile, type FileHandle } from 'node:fs/promises';
+import { endianness } from 'node:os';
 import nodePath from 'node:path';
 
 import {
@@ -31,8 +33,13 @@ import {
   PrevFrameMismatchError,
   WALFrameHeaderSize,
   WALHeaderSize,
+  WALMagicBE,
+  WALMagicLE,
   WALReader,
   WALEOFError,
+  WALVersion,
+  walChecksum,
+  type ByteOrder,
 } from './wal/index.ts';
 import { SnapshotLevel } from './replica-client.ts';
 import { mkdirAll } from './util/fs.ts';
@@ -108,6 +115,95 @@ interface CheckpointRecord {
 /** Path of the checkpoint record of the database at `path`. */
 function checkpointRecordPath(path: string): string {
   return nodePath.join(`${path}-litestream`, 'checkpoint');
+}
+
+/**
+ * RestoredWAL describes the WAL written by {@link writeRestoredWAL}: the WAL
+ * with these salts holds, after its first `walSize` bytes of frames, only
+ * changes on top of the restored database, whose size is `commit` pages.
+ */
+export interface RestoredWAL {
+  salt1: number;
+  salt2: number;
+  walSize: number;
+  commit: number;
+}
+
+/** The record left by a restore which wrote the first WAL of the database. */
+interface RestoreRecord extends RestoredWAL {
+  txid: bigint;
+}
+
+/**
+ * WriteRestoredWAL writes the first WAL of a database just restored at
+ * `path`, unless the database is not in WAL mode: one commit frame, which
+ * holds page 1 as it is in the database file, under random salts. Nothing
+ * may have opened the database since the restore, and its `-shm` file must
+ * not exist.
+ *
+ * SQLite recovers this WAL when the database is opened, and appends the next
+ * commits to it under the same salts. Any reset of the WAL changes them: a
+ * restart gives the next WAL a new salt-2, and a WAL deleted when the last
+ * connection closes is created again with random salts. So while the WAL has
+ * these salts, its frames after the first one are every change made since the
+ * restore, even if a checkpoint copied some of them into the database file:
+ * the next sync can be incremental, where it would otherwise have to upload a
+ * snapshot of the whole database. Returns null when no WAL was written.
+ */
+export async function writeRestoredWAL(path: string, pageSize: number, commit: number): Promise<RestoredWAL | null> {
+  const page = new Uint8Array(pageSize);
+  const fh = await open(path, 'r');
+  try {
+    await readExact(fh, page, 0);
+  } finally {
+    await fh.close();
+  }
+
+  // The file format read and write versions are 2 in WAL mode
+  if (page[18] !== 2 || page[19] !== 2) return null;
+
+  const salts = randomBytes(8);
+  const salt1 = salts.readUInt32BE(0);
+  const salt2 = salts.readUInt32BE(4);
+  // Like SQLite, compute the checksums in the native byte order
+  const bo: ByteOrder = endianness() === 'LE' ? 'le' : 'be';
+  const frameSize = WALFrameHeaderSize + pageSize;
+  const wal = new Uint8Array(WALHeaderSize + frameSize);
+  const view = new DataView(wal.buffer);
+
+  view.setUint32(0, bo === 'le' ? WALMagicLE : WALMagicBE);
+  view.setUint32(4, WALVersion);
+  view.setUint32(8, pageSize);
+  view.setUint32(12, 0); // checkpoint sequence
+  view.setUint32(16, salt1);
+  view.setUint32(20, salt2);
+  let [s0, s1] = walChecksum(bo, 0, 0, wal.subarray(0, 24));
+  view.setUint32(24, s0);
+  view.setUint32(28, s1);
+
+  const frame = WALHeaderSize;
+  view.setUint32(frame, 1); // page number
+  view.setUint32(frame + 4, commit); // database size after a commit
+  view.setUint32(frame + 8, salt1);
+  view.setUint32(frame + 12, salt2);
+  wal.set(page, frame + WALFrameHeaderSize);
+  [s0, s1] = walChecksum(bo, s0, s1, wal.subarray(frame, frame + 8));
+  [s0, s1] = walChecksum(bo, s0, s1, page);
+  view.setUint32(frame + 16, s0);
+  view.setUint32(frame + 20, s1);
+
+  const walPath = `${path}-wal`;
+  const tmp = `${walPath}.tmp`;
+  const out = await open(tmp, 'w');
+  try {
+    await out.writeFile(wal);
+    await out.sync();
+  } finally {
+    await out.close();
+  }
+  await rename(tmp, walPath);
+
+  return { salt1, salt2, walSize: frameSize, commit };
 }
 
 /**
@@ -256,6 +352,40 @@ export class LocalDatabase {
       return { txid: BigInt(r.txid), salt1: r.salt1, salt2: r.salt2, nextSalt1: r.nextSalt1 };
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * RestorePath returns the path of the file recording the WAL written by the
+   * last restore (see {@link writeRestoredWAL}).
+   */
+  restorePath(): string {
+    return nodePath.join(this.metaPath, 'restore');
+  }
+
+  /** Returns the restore record, or null if there is none. */
+  private async restoreRecord(): Promise<RestoreRecord | null> {
+    try {
+      const r = JSON.parse(await readFile(this.restorePath(), 'utf8'));
+      return { txid: BigInt(r.txid), salt1: r.salt1, salt2: r.salt2, walSize: r.walSize, commit: r.commit };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * RecordRestore records that a restore left the database at `txid`, so that
+   * the next sync continues the replica's sequence after it. With the WAL
+   * written by the restore, the next sync is incremental while that WAL is
+   * the current one; otherwise it writes a snapshot. The caller discards the
+   * local LTX files first.
+   */
+  async recordRestore(txid: bigint, wal: RestoredWAL | null): Promise<void> {
+    await rm(this.restorePath(), { force: true });
+    await rm(this.checkpointPath(), { force: true });
+    await writeFile(this.baseTXIDPath(), `${txid}\n`);
+    if (wal !== null) {
+      await writeFile(this.restorePath(), `${JSON.stringify({ txid: String(txid), ...wal })}\n`);
     }
   }
 
@@ -711,9 +841,16 @@ export class LocalDatabase {
     commit: number;
   } | null> {
     const max = await this.maxFile();
+    const base = await this.baseTXID();
     // After a restore the WAL position of the local files, if any, does not
-    // describe the restored database: the next sync starts from a snapshot.
-    if (max === null || max.maxTXID < (await this.baseTXID())) return null;
+    // describe the restored database. The first frame of the WAL written by
+    // the restore does: resuming after it, the next sync is incremental while
+    // that WAL is the current one. Without it, it starts from a snapshot.
+    if (max === null || max.maxTXID < base) {
+      const r = await this.restoreRecord();
+      if (r === null || r.txid !== base) return null;
+      return { walOffset: WALHeaderSize, walSize: r.walSize, salt1: r.salt1, salt2: r.salt2, commit: r.commit };
+    }
     try {
       // Only the 100-byte header is needed; do not read the whole file.
       const fh = await open(this.ltxPath(max.level, max.minTXID, max.maxTXID), 'r');

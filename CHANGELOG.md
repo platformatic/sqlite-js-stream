@@ -6,6 +6,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- The first `sync()` after a restore into the replica's own path (as `ensureExists()` does) uploads
+  only the changes made since the restore, instead of a snapshot of the whole database. The restore
+  writes the first WAL of the restored database: one commit frame holding page 1 unchanged, under
+  random salts recorded in `<db>-litestream/restore`. While the WAL keeps those salts, it holds every
+  change made since the restore; any reset of the WAL changes them, and the next sync falls back to a
+  snapshot. Databases not in WAL mode get no WAL and still start from a snapshot.
+
 ### Fixed
 
 - `sync()` detects a WAL restarted since the previous sync from the salts in the WAL header. With

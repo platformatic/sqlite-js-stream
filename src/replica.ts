@@ -17,7 +17,7 @@
  */
 
 import { createReadStream } from 'node:fs';
-import { access, mkdir, open, readFile, rename, rm, stat, writeFile, type FileHandle } from 'node:fs/promises';
+import { access, mkdir, open, readFile, rename, rm, stat, type FileHandle } from 'node:fs/promises';
 import nodePath from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 
@@ -36,10 +36,12 @@ import {
 import {
   LocalDatabase,
   runCheckpoint,
+  writeRestoredWAL,
   type CheckpointConnection,
   type CheckpointMode,
   type CheckpointToken,
   type OpenReader,
+  type RestoredWAL,
 } from './db.ts';
 import type { ReplicaClient } from './replica-client.ts';
 import { SnapshotLevel } from './replica-client.ts';
@@ -860,9 +862,11 @@ export class Replica {
       await rename(tmp, opt.outputPath);
 
       // Restoring the replicated database itself: the local cache belongs to the
-      // previous database, and the next sync continues after the restored TXID.
+      // previous database, and the next sync continues after the restored TXID,
+      // incrementally from the WAL written here while it is the current one.
       if (nodePath.resolve(opt.outputPath) === nodePath.resolve(this.path)) {
-        await this.resetLocal(plan[plan.length - 1].maxTXID);
+        const wal = await writeRestoredWAL(opt.outputPath, pageSize, commit);
+        await this.resetLocal(plan[plan.length - 1].maxTXID, wal);
       }
     } catch (err) {
       if (fh !== null) await fh.close().catch(() => {});
@@ -1105,15 +1109,16 @@ export class Replica {
 
   /**
    * Discards the local LTX cache and records `txID` as the local position, so
-   * that the next sync writes `txID + 1` from a snapshot of the database.
+   * that the next sync writes `txID + 1`: incrementally from the WAL `wal`
+   * written by the restore while it is the current one, from a snapshot of
+   * the database otherwise.
    */
-  private async resetLocal(txID: bigint): Promise<void> {
+  private async resetLocal(txID: bigint, wal: RestoredWAL | null): Promise<void> {
     this.close();
     const db = await this.localDb();
     await rm(db.ltxDir(), { recursive: true, force: true });
     await mkdir(db.ltxLevelDir(0), { recursive: true });
-    await writeFile(db.baseTXIDPath(), `${txID}\n`);
-    await rm(db.checkpointPath(), { force: true });
+    await db.recordRestore(txID, wal);
     this.posValue = null;
   }
 
