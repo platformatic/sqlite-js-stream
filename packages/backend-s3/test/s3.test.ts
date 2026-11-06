@@ -16,6 +16,7 @@ import {
   S3ReplicaClient,
   type S3ReplicaClientOptions,
 } from '../src/index.ts';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
 import { MemoryS3 } from './helpers/memory-s3.ts';
 import { createWALDB } from './helpers/db.ts';
 
@@ -203,6 +204,29 @@ test('openLtxFile returns empty stream when offset >= size', async () => {
   });
   const buf = await collect(stream);
   assert.equal(buf.length, 0);
+});
+
+test('openLtxFile reads a range with one request, without HeadObject', async () => {
+  const { client, s3 } = makeS3({ bucket: 'b' });
+  const { body } = makeLtxBody(5);
+  s3.objects.set('b/ltx/0/0000000000000001-0000000000000001.ltx', {
+    body: Buffer.from(body),
+    metadata: {},
+    lastModified: new Date(),
+  });
+  const sent: unknown[] = [];
+  s3.onSend = (command) => {
+    sent.push(command);
+  };
+  const read = async (offset: number, size: number): Promise<number[]> =>
+    [...new Uint8Array(await collect(await client.openLtxFile({ level: 0, minTXID: 1n, maxTXID: 1n, offset, size })))];
+
+  // Open ranges read to the end, and ranges ending past it are cut
+  assert.deepEqual(await read(102, 0), [2, 3, 4]);
+  assert.deepEqual(await read(103, 100), [3, 4]);
+  assert.deepEqual(await read(105, 0), []);
+  assert.equal(sent.length, 3);
+  assert.ok(sent.every((command) => command instanceof GetObjectCommand));
 });
 
 test('openLtxFile throws for a missing object', async () => {

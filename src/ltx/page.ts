@@ -49,9 +49,11 @@ export interface DecodedPage {
  * Note: the uncompressed byte length is unknown here; LTX pages are at most
  * `MaxPageSize`, so we decompress into a 64KiB buffer and slice to the bytes
  * written. Callers that know the page size should use `DecodePage` in the
- * decoder for the size-accurate path.
+ * decoder for the size-accurate path, or pass `out`, a buffer of the page
+ * size, to decode into it: `data` is then a view of `out`, and a page that
+ * does not fit fails.
  */
-export function decodePageData(b: Uint8Array): DecodedPage {
+export function decodePageData(b: Uint8Array, out?: Uint8Array): DecodedPage {
   const header = unmarshalPageHeader(b);
   if (header.pgno === 0 && header.flags === 0) {
     return { header, data: new Uint8Array(0) };
@@ -68,10 +70,13 @@ export function decodePageData(b: Uint8Array): DecodedPage {
       throw new LTXFormatError(`buffer too small for data: need ${offset + dataSize}, have ${b.length}`);
     }
     const compressed = b.subarray(offset, offset + dataSize);
-    const buf = new Uint8Array(MaxPageSize);
+    const buf = out ?? new Uint8Array(MaxPageSize);
     const n = decompressBlockInto(compressed, buf);
     if (n <= 0) {
       throw new LTXFormatError('decompress block failed');
+    }
+    if (n > buf.length) {
+      throw new LTXFormatError(`page data of ${n} bytes does not fit in ${buf.length}`);
     }
     return { header, data: buf.subarray(0, n) };
   }

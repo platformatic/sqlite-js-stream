@@ -9,7 +9,10 @@ the other pages in the background. Once every page is present, the database is
 a regular SQLite database and reads are local only.
 
 It lets an application open a large database restored from a replica right away,
-instead of after downloading all of it.
+instead of after downloading all of it. To restore a database replicated with
+[`@platformatic/sqlite-js-stream`](https://github.com/platformatic/sqlite-js-stream#restore-page-by-page),
+call `replica.restorePaged()`: it uses this package to fetch each page from the
+replica when it is read, and fills the others in the background.
 
 > Status: experimental.
 

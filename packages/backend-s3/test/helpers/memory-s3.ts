@@ -198,7 +198,9 @@ export class MemoryS3 {
       const m = /^bytes=(\d+)-(\d*)$/.exec(cmd.input.Range);
       if (m) {
         const start = Number(m[1]);
-        const end = m[2] === '' ? obj.body.length - 1 : Number(m[2]);
+        // Like S3: a range starting past the end fails, one ending past it is cut
+        if (start >= obj.body.length) throw invalidRange(cmd.input.Range);
+        const end = m[2] === '' ? obj.body.length - 1 : Math.min(Number(m[2]), obj.body.length - 1);
         body = obj.body.subarray(start, end + 1);
       }
     }
@@ -270,6 +272,13 @@ function notFound(key: string): Error {
   const err = new Error(`Not Found: ${key}`);
   (err as any).name = 'NotFound';
   (err as any).$metadata = { httpStatusCode: 404 };
+  return err;
+}
+
+function invalidRange(range: string): Error {
+  const err = new Error(`The requested range is not satisfiable: ${range}`);
+  (err as any).name = 'InvalidRange';
+  (err as any).$metadata = { httpStatusCode: 416 };
   return err;
 }
 

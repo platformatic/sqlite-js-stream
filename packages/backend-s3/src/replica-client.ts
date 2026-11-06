@@ -557,19 +557,10 @@ export class S3ReplicaClient implements ReplicaClient {
       }
     }
 
-    // Need the object size to build a range and to handle offset >= size.
-    let head;
-    try {
-      head = await this.client.send(new HeadObjectCommand({ Bucket: this.bucket, Key: key }));
-    } catch (err) {
-      throw new LTXError('open', key, opts.level, opts.minTXID, opts.maxTXID, err);
-    }
-    const len = Number(head.ContentLength ?? 0);
-    if (opts.offset >= len) return Readable.from([]);
-
-    const end = opts.size > 0 ? Math.min(opts.offset + opts.size - 1, len - 1) : len - 1;
-    if (end < opts.offset) return Readable.from([]);
-
+    // A range may end past the end of the object, and an open range reads to
+    // its end, so no HeadObject round-trip is needed: a range starting past the
+    // end fails with 416, and reads nothing.
+    const end = opts.size > 0 ? String(opts.offset + opts.size - 1) : '';
     try {
       const res = await this.client.send(
         new GetObjectCommand({
@@ -580,6 +571,7 @@ export class S3ReplicaClient implements ReplicaClient {
       );
       return res.Body as Readable;
     } catch (err) {
+      if (isInvalidRange(err)) return Readable.from([]);
       throw new LTXError('open', key, opts.level, opts.minTXID, opts.maxTXID, err);
     }
   }
@@ -996,4 +988,10 @@ export function newReplicaClientFromURL(
     opts.secretAccessKey = secretAccessKey;
   }
   return new S3ReplicaClient(opts);
+}
+
+/** Whether a GetObject failed because its range starts past the end of the object. */
+function isInvalidRange(err: unknown): boolean {
+  const e = err as { name?: string; Code?: string; $metadata?: { httpStatusCode?: number } };
+  return e?.name === 'InvalidRange' || e?.Code === 'InvalidRange' || e?.$metadata?.httpStatusCode === 416;
 }

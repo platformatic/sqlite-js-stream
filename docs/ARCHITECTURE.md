@@ -159,6 +159,49 @@ by an earlier restore is ignored.
 Because restore never materializes the full merged LTX (or the whole DB) in memory, peak memory is
 bounded by one page buffer plus the (small) page index, regardless of the database size.
 
+### Replica.restorePaged()
+
+`restorePaged()` (`src/paged-restore.ts`) makes the replica's own database usable before it is
+downloaded, with the SQLite VFS of `@platformatic/sqlite-js-stream-paged-vfs`, an optional peer
+dependency imported only here. The VFS keeps, for each registered database, a bitmap of the pages
+present in a sparse file; a read of a missing page asks the thread that registered the database for
+it and waits, and it never fills a page SQLite wrote meanwhile (see that package's README).
+
+1. `CalcRestorePlan` as for a full restore. When its files add up to less than `minSize`, or the
+   VFS cannot be loaded, it restores fully instead.
+2. The headers of the first and last files give the page size and the final page count. The page
+   index of every file (read concurrently) gives, for each page, the file holding its newest
+   version and the offset and size of its frame there, kept in typed arrays.
+3. The marker `<db>-litestream/paged` is written, the database file and its `-wal`/`-shm` are
+   removed, and the database is registered with the VFS, which creates it sparse at its final size.
+4. Page 1 and the schema table (a b-tree rooted at page 1, with the overflow pages of its records)
+   are filled, walking the b-tree from page 1. The replica's read connection parses the schema and
+   runs on the thread that serves the pages, where a read of a missing page fails rather than
+   waits: these are the only pages of the database file it reads.
+5. The restore writes the first WAL and the restore record, as a full restore does, and resolves.
+
+From then on:
+
+- **Requests.** The VFS asks for a page; it is read with the next frames of the same file, up to
+  `readAhead`, in one ranged read, decoded and filled. A page the background fill is reading is
+  read again in this smaller read, so that a query never waits for a large one. A failed read is
+  retried twice, then the VFS fails the waiting reads with `SQLITE_IOERR_READ`.
+- **Background fill.** Passes over the missing pages in page order, grouping them by file into
+  ranged reads of at most 4 MiB (spanning frames of superseded pages up to 256 KiB), four at a
+  time. Failed reads are retried in the next pass, with a backoff. Pages no file has are filled
+  with zeros, as a full restore leaves them. Once the VFS reports every page present, the marker is
+  removed and `filled` resolves.
+- **Replication.** `LocalDatabase` reads database pages from the file only after the page loader
+  made them present: a page being read waits for that read, a missing one is read with read-ahead.
+  The replica's read connection opens the database through the VFS. `deleteFiles()` keeps the
+  files of the plan until the restore is done, whatever the retention policy.
+- **Stopping.** `close()`, or another restore, closes the VFS registration: reads of missing pages
+  fail, and `filled` rejects with `ErrPagedRestoreClosed`. The marker stays, as after a crash: a
+  replica without a paged restore in progress sees an incomplete database, reports a local
+  position of 0, and refuses to `sync()` or `snapshot()` it (`ErrIncompleteDatabase`), so that its
+  holes are never uploaded as zeros. A full restore removes the marker once the database is
+  complete.
+
 ### Replica.follow()
 
 `follow()` is litestream's `restore -f` continuous mode. It first restores the latest backup to

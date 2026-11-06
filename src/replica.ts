@@ -19,6 +19,7 @@
 import { createReadStream } from 'node:fs';
 import { access, mkdir, open, readFile, rename, rm, stat, type FileHandle } from 'node:fs/promises';
 import nodePath from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import {
@@ -58,17 +59,59 @@ import { noopLogger } from './util/logger.ts';
 import {
   DatabaseError,
   ErrGenerationSuperseded,
+  ErrPagedVfsUnavailable,
   ErrReplicaAhead,
   InvalidArgumentError,
   LTXFormatError,
   PageSizeMismatchError,
   SqliteJsStreamError,
 } from './errors.ts';
+import { loadPagedVfs, PagedRestore, type PagedVfs } from './paged-restore.ts';
 
 export interface RestoreOptions {
   outputPath: string;
   txID?: bigint;
   timestamp?: Date;
+}
+
+/** Options for {@link Replica.restorePaged}. */
+export interface PagedRestoreOptions {
+  /** Restores this transaction instead of the latest. */
+  txID?: bigint;
+  /** Restores the latest backup created at or before this time instead of the latest. */
+  timestamp?: Date;
+  /**
+   * Restores fully, as {@link Replica.restore} does, when the LTX files to
+   * read add up to less than this, in bytes. Defaults to 0.
+   */
+  minSize?: number;
+  /** Pages read with each page a query waits for. Defaults to 32. */
+  readAhead?: number;
+  /** How long a query waits for a missing page before failing, in milliseconds. Defaults to 30 seconds. */
+  timeout?: number;
+  /**
+   * Called when a page a query waited for is filled, with the number of pages
+   * read with it and the time the read took.
+   */
+  onMiss?: (pgno: number, pages: number, durationMs: number) => void;
+}
+
+/** The outcome of {@link Replica.restorePaged}. */
+export interface PagedRestoreResult {
+  /** Whether the database is restored page by page; false if it was restored fully. */
+  paged: boolean;
+  /** Why the database was restored fully although large enough: the paged VFS cannot be used. */
+  unavailable: ErrPagedVfsUnavailable | null;
+  /** The restored TXID. */
+  txID: bigint;
+  /** Total size of the LTX files of the restore, in bytes. */
+  size: number;
+  /**
+   * Resolves once every page is in the local file. Rejects with
+   * `ErrPagedRestoreClosed` if the replica is closed or restored again
+   * before. Already resolved after a full restore.
+   */
+  filled: Promise<void>;
 }
 
 /** Options for {@link Replica.follow}, litestream's `restore -f` continuous mode. */
@@ -311,6 +354,9 @@ export class Replica {
   private runActive = false;
   private openReader: OpenReader | undefined;
   private supersededError: ErrGenerationSuperseded | null = null;
+  // The paged restore filling the database, if any, and the paged VFS once loaded
+  private paged: PagedRestore | null = null;
+  private pagedVfs: PagedVfs | null = null;
 
   constructor(
     path: string,
@@ -407,10 +453,20 @@ export class Replica {
     this.compactionLevelsValue = compactionLevelsForMax(level);
   }
 
-  /** Lazily opens the local database reader (cached). */
+  /**
+   * Lazily opens the local database reader (cached). While a paged restore
+   * fills the database, its pages are filled before they are read, and the
+   * default reader connection opens it through the paged VFS: a read of a
+   * missing page then fails, where it would return zeros otherwise.
+   */
   private async localDb(): Promise<LocalDatabase> {
     if (this.db === null) {
-      this.db = await LocalDatabase.open(this.path, this.openReader);
+      const vfs = this.paged !== null ? this.pagedVfs : null;
+      const openReader: OpenReader | undefined =
+        this.openReader ?? (vfs !== null ? (path) => new DatabaseSync(vfs.databaseUri(path), { readOnly: true }) : undefined);
+      this.db = await LocalDatabase.open(this.path, openReader);
+      const paged = this.paged;
+      if (paged !== null) this.db.setPageLoader((pgno) => paged.load(pgno));
     }
     return this.db;
   }
@@ -438,9 +494,16 @@ export class Replica {
     return max;
   }
 
-  /** LocalPos returns the local cached position (max local level-0 maxTXID). */
+  /**
+   * LocalPos returns the local cached position (max local level-0 maxTXID).
+   * It is 0 when a paged restore of the database did not finish, and no paged
+   * restore of this replica is filling it: the database is incomplete, and
+   * must be restored again.
+   */
   async localPos(): Promise<bigint> {
-    return (await this.localDb()).pos();
+    const db = await this.localDb();
+    if (this.paged === null && (await db.incomplete())) return 0n;
+    return db.pos();
   }
 
   /**
@@ -782,11 +845,15 @@ export class Replica {
     return info;
   }
 
-  /** EnsureExists restores the local database if it is missing. */
+  /**
+   * EnsureExists restores the local database if it is missing, or incomplete
+   * because a paged restore of it did not finish.
+   */
   async ensureExists(): Promise<void> {
+    if (this.paged !== null) return;
     try {
       await access(this.path);
-      return;
+      if (!(await (await this.localDb()).incomplete())) return;
     } catch {
       /* missing; restore below */
     }
@@ -802,22 +869,123 @@ export class Replica {
    */
   async restore(opt: RestoreOptions): Promise<void> {
     if (!opt.outputPath) throw new InvalidArgumentError('output path required');
-
-    const txID = opt.txID ?? 0n;
-    if (txID < 0n) throw new InvalidArgumentError('txID must be >= 0');
-    const timestampMs = opt.timestamp?.getTime();
-    if (timestampMs !== undefined && Number.isNaN(timestampMs)) {
-      throw new InvalidArgumentError('invalid timestamp');
-    }
-    if (txID !== 0n && timestampMs !== undefined) {
-      throw new InvalidArgumentError('cannot restore by both txID and timestamp');
-    }
-
+    const { txID, timestampMs } = restoreTarget(opt);
     const plan = await calcRestorePlan(this.client, txID, timestampMs);
     if (plan.length === 0) throw new NoMatchingBackupError();
+    await this.restorePlan(plan, opt.outputPath);
+  }
 
-    await mkdir(nodePath.dirname(opt.outputPath), { recursive: true });
-    const tmp = `${opt.outputPath}.tmp`;
+  /**
+   * RestorePaged restores the replica's own database page by page, on demand,
+   * with the SQLite VFS of `@platformatic/sqlite-js-stream-paged-vfs`. It
+   * resolves once the database can be opened, long before it is downloaded.
+   *
+   * Open the database with the VFS, with the URI returned by `databaseUri()`
+   * of that package, from another thread than the one which called this
+   * method: a query that reads a page not downloaded yet waits until it is
+   * downloaded, on demand, while the other pages are downloaded in the
+   * background. The thread which called this method serves those requests,
+   * so it must never query the database itself while it is incomplete. Every
+   * connection that writes to the database must use the VFS.
+   *
+   * Replicating goes on as usual meanwhile: {@link sync} and {@link snapshot}
+   * download the pages they read first, and retention keeps the files the
+   * restore still reads. `filled` resolves once every page is in the file.
+   * Closing the replica, or restoring it again, stops the restore and leaves
+   * the database incomplete: {@link localPos} is then 0, and {@link sync}
+   * fails with `ErrIncompleteDatabase`, until it is restored again. The same
+   * holds after a crash during the restore.
+   *
+   * It restores fully, as {@link restore} does, when the files to read are
+   * smaller than `minSize`, or when the paged VFS cannot be used (it is not
+   * installed, or cannot load on this platform). The result tells which.
+   */
+  async restorePaged(opt: PagedRestoreOptions = {}): Promise<PagedRestoreResult> {
+    const { txID, timestampMs } = restoreTarget(opt);
+    const plan = await calcRestorePlan(this.client, txID, timestampMs);
+    if (plan.length === 0) throw new NoMatchingBackupError();
+    const size = plan.reduce((total, info) => total + info.size, 0);
+    const restored = plan[plan.length - 1].maxTXID;
+    const minSize = opt.minSize ?? 0;
+
+    let unavailable: ErrPagedVfsUnavailable | null = null;
+    if (size >= minSize && this.pagedVfs === null) {
+      try {
+        this.pagedVfs = await loadPagedVfs();
+      } catch (err) {
+        if (!(err instanceof ErrPagedVfsUnavailable)) throw err;
+        unavailable = err;
+        this.logger.warn('cannot restore page by page, restoring fully', { path: this.path, err });
+      }
+    }
+
+    const vfs = this.pagedVfs;
+    if (size < minSize || vfs === null) {
+      await this.restorePlan(plan, this.path);
+      return { paged: false, unavailable, txID: restored, size, filled: Promise.resolve() };
+    }
+
+    this.stopPaged();
+    this.closeLocal();
+    const marker = (await this.localDb()).pagedPath();
+    this.closeLocal();
+    await mkdir(nodePath.dirname(this.path), { recursive: true });
+
+    const paged = await PagedRestore.start({
+      vfs,
+      client: this.client,
+      plan,
+      path: this.path,
+      marker,
+      logger: this.logger,
+      readAhead: opt.readAhead,
+      timeout: opt.timeout,
+      onMiss: opt.onMiss,
+    });
+
+    try {
+      const wal = await writeRestoredWAL(this.path, paged.pageSize, paged.pageCount);
+      // Set first, so that the local database reads through it
+      this.paged = paged;
+      await this.resetLocal(restored, wal);
+    } catch (err) {
+      this.stopPaged();
+      paged.close();
+      throw err;
+    }
+
+    const settle = (): void => {
+      if (this.paged !== paged) return;
+      this.paged = null;
+      this.db?.setPageLoader(null);
+    };
+    paged.filled.then(settle, (err) => {
+      settle();
+      if ((err as { code?: string }).code !== 'ERR_PAGED_RESTORE_CLOSED') {
+        this.logger.error('a paged restore failed; the database is incomplete', { path: this.path, err });
+      }
+    });
+    void paged.fill();
+
+    return { paged: true, unavailable: null, txID: restored, size, filled: paged.filled };
+  }
+
+  /** Stops the paged restore filling the database, if any. */
+  private stopPaged(): void {
+    const paged = this.paged;
+    if (paged === null) return;
+    this.paged = null;
+    this.db?.setPageLoader(null);
+    paged.close();
+  }
+
+  /** Restores the files of `plan` into `outputPath`. */
+  private async restorePlan(plan: FileInfo[], outputPath: string): Promise<void> {
+    const self = nodePath.resolve(outputPath) === nodePath.resolve(this.path);
+    if (self) this.stopPaged();
+
+    await mkdir(nodePath.dirname(outputPath), { recursive: true });
+    const tmp = `${outputPath}.tmp`;
 
     let fh: FileHandle | null = null;
     const sources: Array<{ destroy?: () => void }> = [];
@@ -857,16 +1025,18 @@ export class Replica {
 
       // A WAL left by a previous database at this path would be replayed on top
       // of the restored one.
-      await rm(`${opt.outputPath}-wal`, { force: true });
-      await rm(`${opt.outputPath}-shm`, { force: true });
-      await rename(tmp, opt.outputPath);
+      await rm(`${outputPath}-wal`, { force: true });
+      await rm(`${outputPath}-shm`, { force: true });
+      await rename(tmp, outputPath);
 
       // Restoring the replicated database itself: the local cache belongs to the
       // previous database, and the next sync continues after the restored TXID,
       // incrementally from the WAL written here while it is the current one.
-      if (nodePath.resolve(opt.outputPath) === nodePath.resolve(this.path)) {
-        const wal = await writeRestoredWAL(opt.outputPath, pageSize, commit);
+      // The database is complete, even if a paged restore of it did not finish.
+      if (self) {
+        const wal = await writeRestoredWAL(outputPath, pageSize, commit);
         await this.resetLocal(plan[plan.length - 1].maxTXID, wal);
+        await rm((await this.localDb()).pagedPath(), { force: true });
       }
     } catch (err) {
       if (fh !== null) await fh.close().catch(() => {});
@@ -1114,7 +1284,7 @@ export class Replica {
    * the database otherwise.
    */
   private async resetLocal(txID: bigint, wal: RestoredWAL | null): Promise<void> {
-    this.close();
+    this.closeLocal();
     const db = await this.localDb();
     await rm(db.ltxDir(), { recursive: true, force: true });
     await mkdir(db.ltxLevelDir(0), { recursive: true });
@@ -1122,8 +1292,17 @@ export class Replica {
     this.posValue = null;
   }
 
-  /** Close releases any internal database connection. */
+  /**
+   * Close releases any internal database connection, and stops the paged
+   * restore filling the database, if any: the database stays incomplete.
+   */
   close(): void {
+    this.stopPaged();
+    this.closeLocal();
+  }
+
+  /** Closes the local database reader. */
+  private closeLocal(): void {
     if (this.db !== null) {
       this.db.close();
       this.db = null;
@@ -1336,8 +1515,7 @@ export class Replica {
     if (retain > 0 && retained.length > retain) retained = retained.slice(retained.length - retain);
 
     const retainedSet = new Set(retained);
-    const deletedFiles = snapshots.filter((s) => !retainedSet.has(s));
-    await this.deleteFiles(deletedFiles);
+    const deletedFiles = await this.deleteFiles(snapshots.filter((s) => !retainedSet.has(s)));
 
     let boundary = 0n;
     for (const d of deletedFiles) if (d.maxTXID > boundary) boundary = d.maxTXID;
@@ -1360,8 +1538,7 @@ export class Replica {
     if (deletedFiles.length > 0 && deletedFiles[deletedFiles.length - 1] === last) {
       deletedFiles.pop(); // always keep at least one file
     }
-    await this.deleteFiles(deletedFiles);
-    return deletedFiles.length;
+    return (await this.deleteFiles(deletedFiles)).length;
   }
 
   /**
@@ -1391,8 +1568,7 @@ export class Replica {
       if (info.createdAt > threshold) break; // preserve contiguous L0 coverage
       if (this.isCoveredByHigherLevel(info, coverers)) deletedFiles.push(info);
     }
-    await this.deleteFiles(deletedFiles);
-    return deletedFiles.length;
+    return (await this.deleteFiles(deletedFiles)).length;
   }
 
   /** Returns true if `info` is fully contained in a file at a higher level. */
@@ -1413,9 +1589,17 @@ export class Replica {
     return out;
   }
 
-  /** Deletes files from the client and the local cache. */
-  private async deleteFiles(files: FileInfo[]): Promise<void> {
-    if (files.length === 0) return;
+  /**
+   * Deletes files from the client and the local cache, except those a paged
+   * restore still reads. Returns the deleted files.
+   */
+  private async deleteFiles(candidates: FileInfo[]): Promise<FileInfo[]> {
+    const paged = this.paged;
+    const files = paged === null ? candidates : candidates.filter((f) => !paged.reads(f));
+    if (files.length < candidates.length) {
+      this.logger.debug('keeping ltx files a paged restore reads', { count: candidates.length - files.length });
+    }
+    if (files.length === 0) return files;
     this.logger.debug('deleting ltx files', { count: files.length });
     try {
       await this.client.deleteLtxFiles(files);
@@ -1428,6 +1612,7 @@ export class Replica {
       const p = db.ltxPath(f.level, f.minTXID, f.maxTXID);
       await rm(p, { force: true }).catch(() => {});
     }
+    return files;
   }
 
   /**
@@ -1703,4 +1888,18 @@ async function readDbPageSize(path: string): Promise<number> {
   } finally {
     await fh.close();
   }
+}
+
+/** Validates the restore target of `opt`: a TXID (0 for the latest) or a timestamp. */
+function restoreTarget(opt: { txID?: bigint; timestamp?: Date }): { txID: bigint; timestampMs: number | undefined } {
+  const txID = opt.txID ?? 0n;
+  if (txID < 0n) throw new InvalidArgumentError('txID must be >= 0');
+  const timestampMs = opt.timestamp?.getTime();
+  if (timestampMs !== undefined && Number.isNaN(timestampMs)) {
+    throw new InvalidArgumentError('invalid timestamp');
+  }
+  if (txID !== 0n && timestampMs !== undefined) {
+    throw new InvalidArgumentError('cannot restore by both txID and timestamp');
+  }
+  return { txID, timestampMs };
 }

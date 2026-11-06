@@ -111,3 +111,43 @@ export class ErrReplicaAhead extends SqliteJsStreamError {
     this.remoteTXID = remoteTXID;
   }
 }
+
+/**
+ * The paged VFS cannot be used (`ERR_PAGED_VFS_UNAVAILABLE`):
+ * `@platformatic/sqlite-js-stream-paged-vfs` is not installed, has no native
+ * library for this platform, or cannot load it (for example under the
+ * permission model of Node.js, which forbids SQLite extensions). The cause is
+ * in `cause`.
+ */
+export class ErrPagedVfsUnavailable extends SqliteJsStreamError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super('ERR_PAGED_VFS_UNAVAILABLE', message);
+    this.name = 'ErrPagedVfsUnavailable';
+    if (options && 'cause' in options) this.cause = options.cause;
+  }
+}
+
+/**
+ * The local database is incomplete (`ERR_INCOMPLETE_DATABASE`): a paged
+ * restore of it did not finish, so some of its pages are missing from the
+ * file. Raised by `sync()` and `snapshot()` instead of uploading them as
+ * zeros. Restore the database again.
+ */
+export class ErrIncompleteDatabase extends SqliteJsStreamError {
+  constructor(path: string) {
+    super('ERR_INCOMPLETE_DATABASE', `the database ${path} is incomplete: a paged restore of it did not finish`);
+    this.name = 'ErrIncompleteDatabase';
+  }
+}
+
+/**
+ * A paged restore was stopped before every page was filled
+ * (`ERR_PAGED_RESTORE_CLOSED`), because its replica was closed or restored
+ * again. The database stays incomplete until it is restored again.
+ */
+export class ErrPagedRestoreClosed extends SqliteJsStreamError {
+  constructor(path: string) {
+    super('ERR_PAGED_RESTORE_CLOSED', `the paged restore of ${path} was closed before the database was complete`);
+    this.name = 'ErrPagedRestoreClosed';
+  }
+}

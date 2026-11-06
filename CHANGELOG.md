@@ -8,6 +8,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- `S3ReplicaClient.openLtxFile()` reads a range with a single `GetObject`, without
+  the `HeadObject` it sent first, which halves the requests of a paged restore.
 - The first `sync()` after a restore into the replica's own path (as `ensureExists()` does) uploads
   only the changes made since the restore, instead of a snapshot of the whole database. The restore
   writes the first WAL of the restored database: one commit frame holding page 1 unchanged, under
@@ -34,6 +36,18 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+- `Replica.restorePaged()` restores the replica's own database page by page, with
+  `@platformatic/sqlite-js-stream-paged-vfs` (a new optional peer dependency).
+  It resolves once the database can be opened through the VFS; queries from
+  other threads read the pages they need on demand, with read-ahead, while the
+  others are filled in the background (`result.filled`). Replication goes on
+  meanwhile: `sync()` and `snapshot()` read missing pages first, and retention
+  keeps the LTX files the restore reads. A restore stopped by `close()` or a
+  crash leaves the database incomplete: `localPos()` is 0, `sync()` and
+  `snapshot()` throw `ErrIncompleteDatabase`, and `ensureExists()` restores it
+  again. It restores fully below `minSize` bytes, or when the VFS cannot be used.
+  New exports: `PagedRestoreOptions`, `PagedRestoreResult`,
+  `ErrIncompleteDatabase`, `ErrPagedRestoreClosed`, `ErrPagedVfsUnavailable`.
 - `@platformatic/sqlite-js-stream-paged-vfs`, a new package: a SQLite VFS for
   `node:sqlite` that restores a database page by page on demand. Queries run
   while the database downloads; a read of a missing page waits until the

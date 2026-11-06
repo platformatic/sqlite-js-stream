@@ -170,6 +170,9 @@ importers:
         specifier: ^0.2.0
         version: 0.2.0
     devDependencies:
+      '@platformatic/sqlite-js-stream-paged-vfs':
+        specifier: workspace:*
+        version: link:packages/sqlite-js-stream-paged-vfs
       '@types/node':
         specifier: ^26.0.0
         version: 26.6.6

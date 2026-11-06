@@ -50,14 +50,23 @@
     "golden:go": "cd tools/golden && go run .",
     "pretest:all": "pnpm build",
     "test:all": "pnpm test && pnpm -r --filter '!@platformatic/sqlite-js-stream-paged-vfs' test",
-    "test:paged-vfs": "pnpm --filter @platformatic/sqlite-js-stream-paged-vfs build:native && pnpm --filter @platformatic/sqlite-js-stream-paged-vfs test",
+    "test:paged-vfs": "pnpm --filter @platformatic/sqlite-js-stream-paged-vfs build:native && pnpm --filter @platformatic/sqlite-js-stream-paged-vfs build && pnpm --filter @platformatic/sqlite-js-stream-paged-vfs test && node --test test/integration/paged-restore.test.ts",
     "typecheck:all": "pnpm typecheck",
     "bench": "node bench/bench-sync-restore.ts"
   },
   "dependencies": {
     "lz4js": "^0.2.0"
   },
+  "peerDependencies": {
+    "@platformatic/sqlite-js-stream-paged-vfs": "workspace:^"
+  },
+  "peerDependenciesMeta": {
+    "@platformatic/sqlite-js-stream-paged-vfs": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@platformatic/sqlite-js-stream-paged-vfs": "workspace:*",
     "@types/node": "^26.0.0",
     "eslint": "^9.39.5",
     "neostandard": "^0.14.0",

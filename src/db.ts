@@ -43,7 +43,7 @@ import {
 } from './wal/index.ts';
 import { SnapshotLevel } from './replica-client.ts';
 import { mkdirAll } from './util/fs.ts';
-import { DatabaseError } from './errors.ts';
+import { DatabaseError, ErrIncompleteDatabase } from './errors.ts';
 
 /**
  * ReaderConnection is the minimal SQLite connection used to pin a WAL read
@@ -62,6 +62,12 @@ export interface ReaderConnection {
  * Defaults to a read-only `node:sqlite` connection.
  */
 export type OpenReader = (path: string) => ReaderConnection;
+
+/**
+ * PageLoader makes a page present in the database file, while a paged restore
+ * fills it. It returns undefined when the page is already present.
+ */
+export type PageLoader = (pgno: number) => Promise<void> | undefined;
 
 /**
  * CheckpointConnection is the minimal read-write SQLite connection used by
@@ -283,6 +289,7 @@ export class LocalDatabase {
   readonly pageSize: number;
   private conn: ReaderConnection | null = null;
   private openReader: OpenReader;
+  private pageLoader: PageLoader | null = null;
 
   private constructor(path: string, metaPath: string, pageSize: number, openReader: OpenReader) {
     this.path = path;
@@ -387,6 +394,47 @@ export class LocalDatabase {
     if (wal !== null) {
       await writeFile(this.restorePath(), `${JSON.stringify({ txid: String(txid), ...wal })}\n`);
     }
+  }
+
+  /**
+   * PagedPath returns the path of the file which exists while a paged restore
+   * of the database has not filled every page.
+   */
+  pagedPath(): string {
+    return nodePath.join(this.metaPath, 'paged');
+  }
+
+  /** Reports whether a paged restore of the database did not fill every page. */
+  async incomplete(): Promise<boolean> {
+    try {
+      await stat(this.pagedPath());
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * SetPageLoader sets the function which makes a page present in the
+   * database file before it is read from it, while a paged restore fills the
+   * database, or removes it. Without it, an incomplete database is never read.
+   */
+  setPageLoader(loader: PageLoader | null): void {
+    this.pageLoader = loader;
+  }
+
+  /** Throws if the database is incomplete and no page loader can fill it. */
+  private async assertComplete(): Promise<void> {
+    if (this.pageLoader === null && (await this.incomplete())) {
+      throw new ErrIncompleteDatabase(this.path);
+    }
+  }
+
+  /** Reads page `pgno` from the database file into `page`. */
+  private async readDbPage(handle: FileHandle, page: Uint8Array, pgno: number): Promise<void> {
+    const load = this.pageLoader?.(pgno);
+    if (load !== undefined) await load;
+    await readExact(handle, page, (pgno - 1) * page.length);
   }
 
   /** LTXDir returns the local LTX root directory. */
@@ -500,6 +548,7 @@ export class LocalDatabase {
 
   /** Sync builds a level-0 LTX file and writes it to the local cache. */
   async sync(): Promise<FileInfo | null> {
+    await this.assertComplete();
     const pos = await this.pos();
     const txID = pos + 1n;
 
@@ -676,7 +725,7 @@ export class LocalDatabase {
       // Growth pages (not in pageMap) come directly from the database file.
       if (!pageMap.has(pgno)) {
         const page = new Uint8Array(pageSize);
-        await readExact(dbHandle, page, (pgno - 1) * pageSize);
+        await this.readDbPage(dbHandle, page, pgno);
         enc.encodePage({ pgno, flags: 0 }, page);
         continue;
       }
@@ -723,6 +772,7 @@ export class LocalDatabase {
    * a snapshot would cover no data (empty database).
    */
   async snapshot(): Promise<FileInfo | null> {
+    await this.assertComplete();
     const pos = await this.pos();
     const maxTXID = pos === 0n ? 1n : pos;
 
@@ -819,7 +869,7 @@ export class LocalDatabase {
       return new Uint8Array(walBuf.subarray(start, start + pageSize));
     }
     const page = new Uint8Array(pageSize);
-    await readExact(dbHandle, page, (pgno - 1) * pageSize);
+    await this.readDbPage(dbHandle, page, pgno);
     return page;
   }
 

@@ -47,7 +47,8 @@ Importing the addon registers the `s3` URL scheme with
 **`@platformatic/sqlite-js-stream-paged-vfs`** is a SQLite VFS for `node:sqlite`
 which reads the pages of a database on demand, so that an application can query
 a large database while it is still being restored. It is a native library, with
-prebuilt binaries for macOS and Linux. See its
+prebuilt binaries for macOS and Linux. `replica.restorePaged()` uses it when it is
+installed (see [Restore page by page](#restore-page-by-page)). See its
 [README](packages/sqlite-js-stream-paged-vfs/README.md).
 
 ```bash
@@ -147,6 +148,47 @@ not reset: a checkpoint that restarts or truncates it, or the last connection
 closing (which deletes it), makes the next `sync()` fall back to a snapshot.
 With `wal_autocheckpoint` disabled and checkpoints run through
 `replica.checkpoint()` (see below), syncs stay incremental from the restore on.
+
+### Restore page by page
+
+A full restore downloads the whole database before it can be opened. With
+`@platformatic/sqlite-js-stream-paged-vfs` installed, `restorePaged()` restores
+the replica's own database page by page instead: it resolves once the database
+can be opened, and queries read the pages they need on demand while the others
+are downloaded in the background.
+
+```ts
+import { databaseUri } from '@platformatic/sqlite-js-stream-paged-vfs';
+
+const result = await replica.restorePaged({ minSize: 64 * 1024 * 1024 });
+// In a worker thread, not this one:
+const db = new DatabaseSync(databaseUri('/data/app.db'));
+
+await result.filled; // every page is local
+```
+
+- The database is created with every page missing. A query that reads a missing
+  page waits while it is read from the replica, with the next pages of the same
+  LTX file (`readAhead`, 32 by default). Page 1 and the schema are read before
+  `restorePaged()` resolves.
+- Open the database with the URI from `databaseUri()`, from **another thread**
+  than the one that called `restorePaged()`: that thread serves the pages, so a
+  query from it would wait for itself (such reads fail instead). Every
+  connection that writes the database must use the VFS.
+- Replication goes on meanwhile. `sync()` and `snapshot()` read the pages they
+  need first, and retention keeps the LTX files the restore still reads.
+- `result.filled` resolves once every page is local. `replica.close()`, or
+  restoring the database again, stops the restore: the database stays
+  incomplete. So does a crash. An incomplete database has a `localPos()` of 0,
+  and `sync()`/`snapshot()` throw `ErrIncompleteDatabase` until it is restored
+  again (`ensureExists()` does).
+- It restores fully, like `restore()`, when the LTX files to download add up
+  to less than `minSize` bytes, or when the paged VFS cannot be used
+  (`result.unavailable` holds the reason: the package is not installed, has no
+  binary for the platform, or Node.js runs with `--permission`).
+  `result.paged` tells which.
+- `onMiss(pgno, pages, durationMs)` is called for each page a query waited for,
+  for metrics.
 
 ### Manage many databases
 
