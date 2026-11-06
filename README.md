@@ -645,6 +645,30 @@ Conditions are disclosed in the output (rows, batch/transactions, source WAL byt
 process-wide (it includes the Node baseline), so the meaningful claim is that it stays **flat** as the
 database grows — see the `SCALE` mode, which shows WAL bytes and peak RSS at two sizes.
 
+[`bench/bench-paged-restore.ts`](bench/bench-paged-restore.ts) compares a full restore with a
+[paged restore](#restore-page-by-page) as the database grows. The replica is read through a simulated
+network (`LATENCY_MS` per request, one link of `BANDWIDTH_MBPS`), and a worker thread reads a random row
+as soon as the paged restore resolves:
+
+```bash
+pnpm test:paged-vfs   # builds the paged VFS
+pnpm bench:paged
+SIZES=16,64 LATENCY_MS=5 BANDWIDTH_MBPS=500 pnpm bench:paged
+```
+
+On an Apple M4 Max, Node 24.18, with 20 ms per request and 100 MB/s:
+
+| Database | Full restore | Paged: open | Paged: first response | Paged: every page |
+| --- | --- | --- | --- | --- |
+| 16 MiB | 1.31 s | 298 ms | 335 ms | 510 ms |
+| 64 MiB | 4.30 s | 318 ms | 373 ms | 951 ms |
+| 257 MiB | 16.03 s | 343 ms | 370 ms | 2.78 s |
+| 1027 MiB | 64.02 s | 447 ms | 528 ms | 10.09 s |
+
+The first response of a paged restore barely grows with the database: before it resolves, it reads the
+page indexes of the restore plan (a few bytes per page) and the schema, and a query then waits only for
+the pages it reads. Most of the time to open is listing the ten levels of the replica, one request each.
+
 ### Compaction & retention
 
 Over time `sync()` writes one level-0 LTX file per transaction. To keep the replica bounded and
