@@ -89,16 +89,26 @@ test('snapshot retention is time-based and keeps the newest snapshot', async (t)
 
   await replica.sync();
   await replica.snapshot(); // snapshot A
-  await sleep(80);
   tdb.db.exec("INSERT INTO t (name) VALUES ('c')");
   await replica.sync();
   await replica.snapshot(); // snapshot B (newer)
 
-  // Anything older than 50ms is deleted; B is retained, A is removed.
-  const result = await replica.enforceRetention({ snapshotRetentionMs: 50 });
-  assert.equal(result.snapshotsDeleted, 1);
-  const snapshots = await countLevel(client, 9);
-  assert.equal(snapshots.length, 1, 'only the newest snapshot remains');
+  // Drive the time-based retention from the files' own creation times so the
+  // cutoff lands deterministically between A and B. This does not depend on
+  // wall-clock or a fixed sleep, so it cannot flake when a loaded CI runner
+  // delays the test between writes.
+  const snapshots = [...(await countLevel(client, 9))].sort(
+    (x, y) => x.createdAt - y.createdAt,
+  );
+  assert.equal(snapshots.length, 2);
+  const [a, b] = snapshots;
+  assert.ok(b.createdAt > a.createdAt, 'the newer snapshot has a later created time');
+
+  const cutoff = (a.createdAt + b.createdAt) / 2;
+  const result = await replica.enforceSnapshotRetention(b.createdAt, b.createdAt - cutoff, 0);
+  assert.equal(result.deleted, 1, 'the older snapshot is aged out');
+  const kept = await countLevel(client, 9);
+  assert.equal(kept.length, 1, 'only the newest snapshot remains');
 });
 
 test('L0 time retention deletes compacted L0 once it ages out, keeping the head', async (t) => {
@@ -113,14 +123,17 @@ test('L0 time retention deletes compacted L0 once it ages out, keeping the head'
   await replica.sync(); // L0 (2..2)
   await replica.compact({ dstLevel: 1 }); // L0 covered by L1 (1..2)
 
-  // Wait for the files to age past the threshold, then enforce.
-  await sleep(120);
-  const deleted = await replica.enforceL0RetentionByTime(Date.now(), 50);
+  // Use the oldest file's own creation time to place the cutoff well past it,
+  // so the retention result is deterministic and does not depend on wall-clock
+  // or a fixed sleep (which can flake on a loaded runner).
+  const l0 = [...(await countLevel(client, 0))].sort((x, y) => x.createdAt - y.createdAt);
+  const oldest = l0[0];
+  const deleted = await replica.enforceL0RetentionByTime(oldest.createdAt + 1000, 500);
   assert.equal(deleted, 1, 'the older, compacted L0 file is deleted');
 
-  const l0 = await countLevel(client, 0);
-  assert.equal(l0.length, 1, 'the live head L0 is retained');
-  assert.equal(l0[0].maxTXID, 2n);
+  const remaining = await countLevel(client, 0);
+  assert.equal(remaining.length, 1, 'the live head L0 is retained');
+  assert.equal(remaining[0].maxTXID, 2n);
 });
 
 test('run() compacts per level using time-bucketed scheduling', async (t) => {
