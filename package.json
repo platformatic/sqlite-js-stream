@@ -4,7 +4,7 @@
   "description": "Monorepo for @platformatic/sqlite-js-stream and its addons",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@12.16.1",
+  "packageManager": "pnpm@12.18.0",
   "engines": {
     "node": ">=24"
   },
