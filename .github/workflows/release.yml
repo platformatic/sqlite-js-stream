@@ -75,7 +75,7 @@ jobs:
         run: git push origin HEAD:${{ github.ref }}
 
       - name: Download paged-vfs binaries
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           pattern: paged-vfs-*
           path: packages/sqlite-js-stream-paged-vfs/artifacts
