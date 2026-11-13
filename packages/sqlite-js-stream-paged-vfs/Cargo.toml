@@ -13,7 +13,7 @@ path = "native/lib.rs"
 # Only the type definitions are used: the functions of SQLite are read from the API table that node:sqlite passes to
 # sqlite3_extension_init(), so that the VFS is registered in the SQLite linked into Node.js. Never enable "bundled".
 # .cargo/config.toml disables pkg-config, so that the library is not linked to a system SQLite either.
-libsqlite3-sys = { version = "0.39", features = ["loadable_extension"] }
+libsqlite3-sys = { version = "0.40", features = ["loadable_extension"] }
 napi = { version = "3", default-features = false, features = ["napi4"] }
 napi-derive = "3"
 
