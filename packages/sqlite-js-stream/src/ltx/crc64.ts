@@ -13,23 +13,34 @@
  *     `tab[byte(crc) ^ v] ^ (crc >> 8)`
  */
 
-const ISO_POLY = 0xd800000000000000n;
-const MASK64 = 0xffffffffffffffffn;
+// The 64-bit values are kept as two unsigned 32-bit halves: BigInt arithmetic
+// allocates, and one checksum is computed for every byte of every page.
+const ISO_POLY_HI = 0xd8000000;
+const ISO_POLY_LO = 0x00000000;
 
-/** Builds the 256-entry CRC table for a reflected polynomial. */
-function makeTable(poly: bigint): bigint[] {
-  const table: bigint[] = new Array(256);
+/** Builds the 256-entry CRC table for a reflected polynomial, as its two halves. */
+function makeTable(polyHi: number, polyLo: number): [Uint32Array, Uint32Array] {
+  const hi = new Uint32Array(256);
+  const lo = new Uint32Array(256);
   for (let i = 0; i < 256; i++) {
-    let crc = BigInt(i);
+    let h = 0;
+    let l = i;
     for (let j = 0; j < 8; j++) {
-      crc = (crc & 1n) !== 0n ? (crc >> 1n) ^ poly : crc >> 1n;
+      const carry = l & 1;
+      l = ((l >>> 1) | (h << 31)) >>> 0;
+      h >>>= 1;
+      if (carry !== 0) {
+        h = (h ^ polyHi) >>> 0;
+        l = (l ^ polyLo) >>> 0;
+      }
     }
-    table[i] = crc;
+    hi[i] = h;
+    lo[i] = l;
   }
-  return table;
+  return [hi, lo];
 }
 
-const ISO_TABLE = makeTable(ISO_POLY);
+const [ISO_TABLE_HI, ISO_TABLE_LO] = makeTable(ISO_POLY_HI, ISO_POLY_LO);
 
 /**
  * Crc64 is a streaming CRC-64 hasher, equivalent to Go's `hash/crc64`
@@ -37,23 +48,29 @@ const ISO_TABLE = makeTable(ISO_POLY);
  * obtain the running checksum. `reset()` re-initializes the hasher.
  */
 export class Crc64 {
-  private crc: bigint = MASK64;
+  private hi = 0xffffffff;
+  private lo = 0xffffffff;
 
   update(buf: Uint8Array): void {
-    let crc = this.crc;
+    let hi = this.hi;
+    let lo = this.lo;
     for (let i = 0; i < buf.length; i++) {
-      crc = ISO_TABLE[Number((crc ^ BigInt(buf[i])) & 0xffn)] ^ (crc >> 8n);
+      const index = (lo ^ buf[i]) & 0xff;
+      lo = (ISO_TABLE_LO[index] ^ ((lo >>> 8) | (hi << 24))) >>> 0;
+      hi = (ISO_TABLE_HI[index] ^ (hi >>> 8)) >>> 0;
     }
-    this.crc = crc;
+    this.hi = hi;
+    this.lo = lo;
   }
 
   reset(): void {
-    this.crc = MASK64;
+    this.hi = 0xffffffff;
+    this.lo = 0xffffffff;
   }
 
   /** Returns the digest of all data written so far. */
   sum64(): bigint {
-    return this.crc ^ MASK64;
+    return (BigInt(~this.hi >>> 0) << 32n) | BigInt(~this.lo >>> 0);
   }
 }
 
