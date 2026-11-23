@@ -646,6 +646,17 @@ Conditions are disclosed in the output (rows, batch/transactions, source WAL byt
 process-wide (it includes the Node baseline), so the meaningful claim is that it stays **flat** as the
 database grows — see the `SCALE` mode, which shows WAL bytes and peak RSS at two sizes.
 
+[`bench/bench-ltx-encode.ts`](bench/bench-ltx-encode.ts) measures the CPU cost of writing a page to an
+LTX file, i.e. its CRC-64 checksum and its LZ4 compression, on pages of text and on random pages:
+
+```bash
+pnpm bench:encode
+# compare with the BigInt implementations they replaced:
+BASELINE=1 pnpm bench:encode
+# another page size:
+PAGE_SIZE=65536 PAGES=256 pnpm bench:encode
+```
+
 ### Compaction & retention
 
 Over time `sync()` writes one level-0 LTX file per transaction. To keep the replica bounded and
