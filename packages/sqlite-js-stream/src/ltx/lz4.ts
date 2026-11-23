@@ -27,9 +27,13 @@ const WIN_MASK = WIN_SIZE - 1;
 const MIN_MATCH = 4;
 const MF_LIMIT = 10 + MIN_MATCH; // Last match cannot start within the last 14 bytes.
 const ADAPT_SKIP_LOG = 7;
-const PRIME6 = 227718039650203n;
-const U64_MASK = 0xffffffffffffffffn;
-const U32_MASK = 0xffffffffn;
+// The 48-bit prime of the hash, 227718039650203, as its low 32 and high 16 bits:
+// 64-bit values are handled as 32-bit halves, since BigInt arithmetic
+// allocates and the scan below runs for every byte of every page.
+const PRIME6_LO = 0xbcdcbf9b;
+const PRIME6_LO0 = PRIME6_LO & 0xffff;
+const PRIME6_LO1 = PRIME6_LO >>> 16;
+const PRIME6_HI = 0xcf1b;
 
 // Hash table state. `inUse` is a bitmap so we can clear the table cheaply.
 const hashTable = new Uint16Array(HT_SIZE);
@@ -43,31 +47,35 @@ export function compressBlockBound(n: number): number {
   return n + ((n / 255) | 0) + 16;
 }
 
-/** Hashes the lower 6 bytes of a 64-bit little-endian value into a hash index. */
-function blockHash(x: bigint): number {
-  return Number((((x << 16n) * PRIME6) & U64_MASK) >> 48n);
-}
-
-/** Reads the 64-bit little-endian value at `o` (used by the Fast scan). */
-function readU64(b: Uint8Array, o: number): bigint {
-  let x = 0n;
-  for (let i = 7; i >= 0; i--) x = (x << 8n) | BigInt(b[o + i]);
-  return x;
-}
-
 /** Reads the 32-bit little-endian value at `o`. */
 function readU32(b: Uint8Array, o: number): number {
   return (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0;
 }
 
-/** Returns the number of leading zero bytes in a 64-bit little-endian value. */
-function trailingZeroBytes(x: bigint): number {
-  let n = 0;
-  while ((x & 0xffn) === 0n && n < 8) {
-    x >>= 8n;
-    n++;
-  }
-  return n;
+/**
+ * Hashes the 6 bytes at `o` into a hash index. Mirrors `blockHash` of Go,
+ * `((x << 16) * prime6) >> 48` on the 64-bit little-endian value at `o`: the
+ * result is the bits 32 to 47 of the product of the lower 48 bits of `x` by
+ * the prime, computed here from 16-bit and 32-bit parts.
+ */
+function blockHash(b: Uint8Array, o: number): number {
+  const lo = readU32(b, o);
+  const hi = b[o + 4] | (b[o + 5] << 8);
+  const lo0 = lo & 0xffff;
+  const lo1 = lo >>> 16;
+
+  // The bits 32 to 47 of lo * PRIME6_LO, a 64-bit product
+  const mid = lo1 * PRIME6_LO0 + ((lo0 * PRIME6_LO0) >>> 16);
+  const mid2 = lo0 * PRIME6_LO1 + (mid & 0xffff);
+  const carry = Math.floor(mid / 0x10000) + Math.floor(mid2 / 0x10000);
+  const high = Math.imul(lo1, PRIME6_LO1) + carry;
+
+  return (high + Math.imul(lo, PRIME6_HI) + Math.imul(hi, PRIME6_LO)) & 0xffff;
+}
+
+/** Returns the number of trailing zero bytes of a non-zero 32-bit value. */
+function trailingZeroBytes(x: number): number {
+  return (31 - Math.clz32(x & -x)) >>> 3;
 }
 
 /**
@@ -112,9 +120,9 @@ function compressBlockInto(src: Uint8Array, dst: Uint8Array): number {
 
   if (sn > 0) {
     for (; si < sn;) {
-      const match = readU64(src, si);
-      let h = blockHash(match);
-      const h2 = blockHash(match >> 8n);
+      // The 8 bytes at si are looked at as three windows of 6, at si, si + 1 and si + 2
+      let h = blockHash(src, si);
+      const h2 = blockHash(src, si + 1);
       const ref = tableGet(h, si);
       const ref2 = tableGet(h2, si + 1);
       tablePut(h, si);
@@ -122,16 +130,16 @@ function compressBlockInto(src: Uint8Array, dst: Uint8Array): number {
 
       let offset = si - ref;
 
-      if (offset <= 0 || offset >= WIN_SIZE || (match & U32_MASK) !== BigInt(readU32(src, ref))) {
-        h = blockHash(match >> 16n);
+      if (offset <= 0 || offset >= WIN_SIZE || readU32(src, si) !== readU32(src, ref)) {
+        h = blockHash(src, si + 2);
         const ref3 = tableGet(h, si + 2);
         si += 1;
         offset = si - ref2;
-        if (offset <= 0 || offset >= WIN_SIZE || ((match >> 8n) & U32_MASK) !== BigInt(readU32(src, ref2))) {
+        if (offset <= 0 || offset >= WIN_SIZE || readU32(src, si) !== readU32(src, ref2)) {
           si += 1;
           offset = si - ref3;
           tablePut(h, si);
-          if (offset <= 0 || offset >= WIN_SIZE || ((match >> 16n) & U32_MASK) !== BigInt(readU32(src, ref3))) {
+          if (offset <= 0 || offset >= WIN_SIZE || readU32(src, si) !== readU32(src, ref3)) {
             si += 2 + ((si - anchor) >>> ADAPT_SKIP_LOG);
             continue;
           }
@@ -158,13 +166,17 @@ function compressBlockInto(src: Uint8Array, dst: Uint8Array): number {
 
       // Find the longest match by comparing 8 bytes at a time.
       while (si + 8 <= sn) {
-        const x = readU64(src, si) ^ readU64(src, si - offset);
-        if (x === 0n) {
-          si += 8;
-        } else {
-          si += trailingZeroBytes(x);
+        const low = readU32(src, si) ^ readU32(src, si - offset);
+        if (low !== 0) {
+          si += trailingZeroBytes(low);
           break;
         }
+        const high = readU32(src, si + 4) ^ readU32(src, si + 4 - offset);
+        if (high !== 0) {
+          si += 4 + trailingZeroBytes(high);
+          break;
+        }
+        si += 8;
       }
 
       mLen = si - matchBase;
@@ -214,7 +226,7 @@ function compressBlockInto(src: Uint8Array, dst: Uint8Array): number {
       if (si >= sn) break;
 
       // Hash match end-2.
-      h = blockHash(readU64(src, si - 2));
+      h = blockHash(src, si - 2);
       tablePut(h, si - 2);
     }
   }

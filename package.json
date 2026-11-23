@@ -29,6 +29,7 @@
     "test:all": "pnpm -r --filter '!@platformatic/sqlite-js-stream-paged-vfs' test",
     "test:paged-vfs": "pnpm --filter @platformatic/sqlite-js-stream-paged-vfs build:native && pnpm --filter @platformatic/sqlite-js-stream-paged-vfs build && pnpm --filter @platformatic/sqlite-js-stream-paged-vfs test && node --test packages/sqlite-js-stream/test/integration/paged-restore.test.ts",
     "bench": "pnpm --filter @platformatic/sqlite-js-stream bench",
+    "bench:encode": "pnpm --filter @platformatic/sqlite-js-stream bench:encode",
     "golden:go": "cd packages/sqlite-js-stream/tools/golden && go run ."
   },
   "devDependencies": {
