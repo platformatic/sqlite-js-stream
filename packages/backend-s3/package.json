@@ -1,6 +1,6 @@
 {
   "name": "@platformatic/sqlite-js-stream-s3",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Amazon S3 upload strategy (replica client) for @platformatic/sqlite-js-stream",
   "type": "module",
   "engines": {

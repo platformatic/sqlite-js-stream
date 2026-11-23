@@ -1,6 +1,6 @@
 {
   "name": "@platformatic/sqlite-js-stream-paged-vfs",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "SQLite VFS that reads the pages of a database on demand, for @platformatic/sqlite-js-stream",
   "type": "module",
   "engines": {
